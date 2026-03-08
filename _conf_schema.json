@@ -1,0 +1,79 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "hint": "启用或禁用流式消息分段插件行为。",
+    "type": "bool",
+    "default": true
+  },
+  "only_unsupported_platform": {
+    "description": "仅限不支持的平台",
+    "hint": "仅在不支持原生流式消息接收的平台开启分段处理。",
+    "type": "bool",
+    "default": true
+  },
+  "local_stream_processing": {
+    "description": "本地流式处理",
+    "hint": "保持模型端流式生成，并在本插件内本地消耗流式数据分段发送。",
+    "type": "bool",
+    "default": true
+  },
+  "only_model_result": {
+    "description": "仅处理模型结果",
+    "hint": "仅处理由模型生成的回复，忽略普通插件或特殊类型的回复。",
+    "type": "bool",
+    "default": true
+  },
+  "inject_prompt": {
+    "description": "注入标签提示词",
+    "hint": "在系统提示词中注入规则，强制模型在开头输出 [SHORT] 或 [LONG]。",
+    "type": "bool",
+    "default": true
+  },
+  "default_mode_no_tag": {
+    "description": "默认回退模式",
+    "hint": "当模型没有返回 [SHORT] 或 [LONG] 标签时的默认处理模式。",
+    "type": "string",
+    "default": "long",
+    "options": [
+      "short",
+      "long",
+      "auto"
+    ]
+  },
+  "auto_short_max_chars": {
+    "description": "自动短消息字数阈值",
+    "hint": "在 auto 模式下，字数小于等于该值将被视为短消息。",
+    "type": "int",
+    "default": 120
+  },
+  "split_punctuations": {
+    "description": "分段标点符号",
+    "hint": "用于触发短消息分段的标点符号正则表达式（包含换行符）。例如：[。？！!?；;…\\n]",
+    "type": "string",
+    "default": "[。？！!?；;…\\n]"
+  },
+  "drop_punctuations": {
+    "description": "丢弃分段符号",
+    "hint": "分段后，如果该段末尾匹配此正则表达式，则将其丢弃（不再发送）。例如：[。.]",
+    "type": "string",
+    "default": "[。.]"
+  },
+  "min_chunk_chars": {
+    "description": "最小分段片段字数",
+    "hint": "达到该字数后，遇到分段标点符号才会进行分割。",
+    "type": "int",
+    "default": 6
+  },
+  "max_chunk_chars": {
+    "description": "最大分段片段字数",
+    "hint": "强制分段字数。当连续字数达到该值时会被强制截断。建议比平台单条限制稍小。",
+    "type": "int",
+    "default": 160
+  },
+  "segment_interval_seconds": {
+    "description": "分段发送时间间隔",
+    "hint": "每条分段短消息发送之间的延迟时间（秒），可以制造模拟打字停顿效果。",
+    "type": "float",
+    "default": 0.8
+  }
+}

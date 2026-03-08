@@ -1,14 +1,20 @@
-# astrbot-plugin-helloworld
+# AstrBot Plugin StreamChunk 智能流式消息分段插件
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+这是一款针对不支持原生流式传输的平台（如QQ等）开发的中间件插件。通过智能判别语言模型回复的长短及意图，能够带来更类人的聊天体验。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 特性
+- **智能策略选择**：通过注入特定的 Prompt 给模型，自动判别回复意图。针对简短聊天采用模拟人打字的逐段发送模式，针对总结、长文或代码块使用一次发送完整的长文本。
+- **本地流式处理**：在保留模型流式生成特性的情况下，在 AstrBot 本地完成流式接收并组装。
+- **定制化截断与发送体验**：可以完全自定义停顿标点、最小分段字数以及最大单条消息限制，支持配置连续发送的物理延时。
 
-# Supports
+## 适用场景
+推荐在不支持**流式传输（Streaming）**的 IM 平台（如QQ等）上开启并结合使用。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 配置项
+所有的配置项都可以在 AstrBot 的前端管理面板中更改，以下是主要的配置及其含义：
+
+1. **启用插件 (enabled)**：启用或禁用流式消息分段插件。
+2. **仅限不支持的平台 (only_unsupported_platform)**：仅在不支持原生流式的平台处理，避免对支持流式的平台造成冲突。默认开启。
+3. **注入标签提示词 (inject_prompt)**：在系统提示词中注入规则，让模型在开头输出 `[SHORT]` 或 `[LONG]`。
+4. **分段标点符号 (split_punctuations)**：遇到匹配的正则表达式符号时（建议配置为如 `[。？！!?；;…\n]` 等），触发短内容的分段。
+5. **丢弃分段符号 (drop_punctuations)**：在执行短内容分段时，如果段落末尾匹配设定的正则表达式（建议配置为 `[。.]` 等），则将其丢弃不再发送。这可以用来实现发送连续短消息时不带句号的更自然的效果。
