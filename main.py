@@ -8,7 +8,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Node, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
@@ -278,6 +278,57 @@ class StreamChunkPlugin(Star):
             chunk = chunk[:-1].strip()
         return chunk
 
+    def _get_forward_threshold(self, event: AstrMessageEvent) -> int:
+        get_config = getattr(self.context, "get_config", None)
+        if not callable(get_config):
+            return 0
+
+        try:
+            config = get_config(getattr(event, "unified_msg_origin", None))
+        except Exception as e:
+            logger.warning(
+                f"streamchunk: failed to get AstrBot config for forward threshold: {e}"
+            )
+            return 0
+
+        if not hasattr(config, "get"):
+            return 0
+
+        try:
+            platform_settings = config.get("platform_settings", {})
+            threshold = int(platform_settings.get("forward_threshold", 0))
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+        return max(threshold, 0)
+
+    def _should_send_as_forward(self, event: AstrMessageEvent, text: str) -> bool:
+        if event.get_platform_name() != "aiocqhttp":
+            return False
+
+        threshold = self._get_forward_threshold(event)
+        if threshold <= 0:
+            return False
+
+        return len(text) > threshold
+
+    async def _send_forward_message(self, event: AstrMessageEvent, text: str) -> bool:
+        normalized = text.strip()
+        if not normalized or not self._should_send_as_forward(event, normalized):
+            return False
+
+        logger.info(
+            "streamchunk: text length %s exceeded forward threshold, sending merged forward instead.",
+            len(normalized),
+        )
+        node = Node(
+            uin=event.get_self_id(),
+            name="AstrBot",
+            content=[Plain(normalized)],
+        )
+        await event.send(MessageChain([node]))
+        return True
+
     def _split_short_text(self, text: str) -> list[str]:
         if not text.strip():
             return []
@@ -360,6 +411,8 @@ class StreamChunkPlugin(Star):
     ) -> str:
         text = long_buffer.strip()
         if text:
+            if await self._send_forward_message(event, text):
+                return ""
             await event.send(MessageChain([Plain(text)]))
             return ""
         return long_buffer
@@ -531,6 +584,13 @@ class StreamChunkPlugin(Star):
 
         if not text.strip():
             logger.warning("streamchunk: 检测到由于标签截断导致的空内容，已跳过发送。")
+            return
+
+        if await self._send_forward_message(event, text):
+            logger.info(
+                "streamchunk: sent merged forward message using AstrBot forward_threshold."
+            )
+            result.chain = []
             return
 
         if mode == "short":
