@@ -27,8 +27,8 @@ class StreamChunkPlugin(Star):
     PROMPT_TEMPLATE = (
         "[STREAMCHUNK_LENGTH_TAG_RULE]\n"
         "你必须在回复开始前输出一个系统标签：[SHORT] 或 [LONG]。\n"
-        "【[SHORT] 使用条件】你打算回复的字数在120字以下时使用，会被系统分为多条消息发送，更像人们的聊天风格。例如日常闲聊时使用 [SHORT]。\n"
-        "【[LONG] 使用条件】你打算回复的字数在120字以上时使用，只会发送一条消息，避免消息太多刷屏。例如你的回复是一篇短文、文章、代码、包含多个列表项或者是长段落时使用 [LONG]。\n"
+        "【[SHORT] 使用条件】你打算回复的字数在100字以下时使用，会被系统分为多条消息发送，更像人们的聊天风格。例如日常闲聊时使用 [SHORT]。\n"
+        "【[LONG] 使用条件】你打算回复的字数在150字以上时使用，只会发送一条消息，避免消息太多刷屏。例如你的回复是一篇短文、文章、代码、包含多个列表项或者是长段落时使用 [LONG]。\n"
         "标签必须放在最前面，不要附带任何解释。"
     )
     TAG_DETECT_MAX_CHARS = 64
@@ -272,7 +272,7 @@ class StreamChunkPlugin(Star):
             size = len(buf)
             should_cut = False
 
-            if size >= self.min_chunk_chars and self.split_pattern.search(char):
+            if self.split_pattern.search(char):
                 should_cut = True
             elif size >= self.max_chunk_chars:
                 should_cut = True
@@ -307,7 +307,7 @@ class StreamChunkPlugin(Star):
         for idx, char in enumerate(text, start=1):
             seg_len = idx - last_cut
             should_cut = False
-            if seg_len >= self.min_chunk_chars and self.split_pattern.search(char):
+            if self.split_pattern.search(char):
                 should_cut = True
             elif seg_len >= self.max_chunk_chars:
                 should_cut = True
