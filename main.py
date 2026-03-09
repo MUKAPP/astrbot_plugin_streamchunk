@@ -77,6 +77,11 @@ class StreamChunkPlugin(Star):
             160,
             min_value=self.min_chunk_chars,
         )
+        self.max_short_chunks = self._as_int(
+            self._config.get("max_short_chunks", 0),
+            0,
+            min_value=0,
+        )
         self.segment_interval_seconds = self._as_float(
             self._config.get("segment_interval_seconds", 0.8),
             0.8,
@@ -329,41 +334,15 @@ class StreamChunkPlugin(Star):
         await event.send(MessageChain([node]))
         return True
 
-    def _split_short_text(self, text: str) -> list[str]:
-        if not text.strip():
-            return []
-
-        chunks: list[str] = []
-        buf: list[str] = []
-
-        for char in text:
-            buf.append(char)
-            size = len(buf)
-            should_cut = False
-
-            if self.split_pattern.search(char) and size >= self.min_chunk_chars:
-                should_cut = True
-            elif size >= self.max_chunk_chars:
-                should_cut = True
-
-            if should_cut:
-                segment = self._normalize_chunk("".join(buf))
-                if segment:
-                    chunks.append(segment)
-                buf.clear()
-
-        if buf:
-            segment = self._normalize_chunk("".join(buf))
-            if segment:
-                chunks.append(segment)
-
-        return chunks or [text.strip()]
-
     def _split_short_text_incremental(
         self,
         text: str,
         final: bool = False,
-    ) -> tuple[list[str], str]:
+        sent_chunks: int = 0,
+    ) -> tuple[list[str], str, bool]:
+        if self.max_short_chunks > 0 and sent_chunks >= self.max_short_chunks:
+            return [], text, True
+
         chunks: list[str] = []
         last_cut = 0
 
@@ -380,15 +359,42 @@ class StreamChunkPlugin(Star):
                 if part:
                     chunks.append(part)
                 last_cut = idx
+                if (
+                    self.max_short_chunks > 0
+                    and sent_chunks + len(chunks) >= self.max_short_chunks
+                ):
+                    return chunks, text[last_cut:], True
 
         remain = text[last_cut:]
         if final and remain.strip():
+            if (
+                self.max_short_chunks > 0
+                and sent_chunks + len(chunks) >= self.max_short_chunks
+            ):
+                return chunks, remain, True
             part = self._normalize_chunk(remain)
             if part:
                 chunks.append(part)
             remain = ""
 
-        return chunks, remain
+        return chunks, remain, False
+
+    async def _send_short_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+    ) -> tuple[int, bool]:
+        chunks, remain, limit_reached = self._split_short_text_incremental(
+            text,
+            final=True,
+        )
+        await self._send_chunks(event, chunks)
+
+        if limit_reached and remain.strip():
+            logger.info("streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。")
+            await self._send_long_text_if_present(event, remain)
+
+        return len(chunks), limit_reached
 
     async def _send_chunks(self, event: AstrMessageEvent, chunks: list[str]) -> None:
         total = len(chunks)
@@ -425,8 +431,9 @@ class StreamChunkPlugin(Star):
         final: bool,
     ) -> str:
         if mode == "short":
-            chunks, remain = self._split_short_text_incremental(
-                text_buffer, final=final
+            chunks, remain, _ = self._split_short_text_incremental(
+                text_buffer,
+                final=final,
             )
             await self._send_chunks(event, chunks)
             return remain
@@ -442,6 +449,7 @@ class StreamChunkPlugin(Star):
         mode: str | None = None
         prefix_buffer = ""
         text_buffer = ""
+        short_chunks_sent = 0
 
         async for chain in generator:
             if not isinstance(chain, MessageChain):
@@ -514,12 +522,19 @@ class StreamChunkPlugin(Star):
                     # 这里保持缓冲，不进行 flush
 
                 if mode == "short":
-                    text_buffer = await self._flush_text_buffer(
-                        event,
-                        mode,
+                    chunks, remain, limit_reached = self._split_short_text_incremental(
                         text_buffer,
                         final=False,
+                        sent_chunks=short_chunks_sent,
                     )
+                    await self._send_chunks(event, chunks)
+                    short_chunks_sent += len(chunks)
+                    text_buffer = remain
+                    if limit_reached:
+                        logger.info(
+                            "streamchunk: SHORT 模式分段达到上限，剩余内容切换为整段发送。"
+                        )
+                        mode = "long"
 
         if mode is None:
             mode_candidate, remaining, need_more = self._detect_mode_from_prefix(
@@ -547,6 +562,19 @@ class StreamChunkPlugin(Star):
         logger.info(
             f"streamchunk: 流式返回处理完毕，最终采取发送模式: [{mode.upper()}]"
         )
+        if mode == "short":
+            chunks, remain, limit_reached = self._split_short_text_incremental(
+                text_buffer,
+                final=True,
+                sent_chunks=short_chunks_sent,
+            )
+            await self._send_chunks(event, chunks)
+            if limit_reached and remain.strip():
+                logger.info(
+                    "streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。"
+                )
+                await self._send_long_text_if_present(event, remain)
+            return
         await self._flush_text_buffer(event, mode, text_buffer, final=True)
 
     @filter.on_decorating_result(priority=-100)
@@ -594,11 +622,12 @@ class StreamChunkPlugin(Star):
             return
 
         if mode == "short":
-            chunks = self._split_short_text(text)
-            await self._send_chunks(event, chunks)
+            chunk_count, limit_reached = await self._send_short_text(event, text)
             logger.info(
-                f"streamchunk: [{mode.upper()}] 模式，已发送 {len(chunks)} 个分段消息。"
+                f"streamchunk: [{mode.upper()}] 模式，已发送 {chunk_count} 个分段消息。"
             )
+            if limit_reached:
+                logger.info("streamchunk: SHORT 模式剩余内容已改为整段发送。")
         else:
             await event.send(MessageChain([Plain(text)]))
             logger.info(

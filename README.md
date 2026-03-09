@@ -25,8 +25,11 @@
 9. `drop_punctuations`：分段后末尾命中该正则时丢弃末尾符号（例如 `[。.]`）。
 10. `min_chunk_chars`：最小分段片段长度。达到该长度后，遇到分段标点才会切分。
 11. `max_chunk_chars`：最大分段片段长度。达到后强制切分。
-12. `segment_interval_seconds`：分段消息之间的发送延迟（秒）。
+12. `max_short_chunks`：SHORT 模式最多分段数。超过后，剩余内容改为一次发送；`0` 表示不限制。
+13. `segment_interval_seconds`：分段消息之间的发送延迟（秒）。
 
 ## 说明
 - 标签只在回复开头识别，避免正文中出现 `[SHORT]` / `[LONG]` 时误判。
 - 在流式和非流式路径中，短消息分段规则保持一致。
+- 当 SHORT 模式分段数量达到 `max_short_chunks` 时，剩余内容会改为一次发送，并继续复用长文本与合并转发逻辑。
+

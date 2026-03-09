@@ -70,6 +70,12 @@
     "type": "int",
     "default": 160
   },
+  "max_short_chunks": {
+    "description": "SHORT 模式最多分段数",
+    "hint": "SHORT 模式下最多发送多少条分段消息。达到该数量后，剩余内容将改为一次发送；0 表示不限制。",
+    "type": "int",
+    "default": 0
+  },
   "segment_interval_seconds": {
     "description": "分段发送时间间隔",
     "hint": "每条分段短消息发送之间的延迟时间（秒），可以制造模拟打字停顿效果。",
@@ -77,3 +83,4 @@
     "default": 0.8
   }
 }
+
