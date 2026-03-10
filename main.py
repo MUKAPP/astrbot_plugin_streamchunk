@@ -456,6 +456,38 @@ class StreamChunkPlugin(Star):
                 continue
 
             if chain.type == "break":
+                # Agent inserts a break before starting tool execution.
+                # Flush any pending user-visible text so it won't be delayed until tools finish.
+                logger.info(
+                    "streamchunk: got stream break, flushing buffered text before tool call."
+                )
+
+                if mode is None:
+                    pending = (prefix_buffer + text_buffer).strip()
+                    prefix_buffer = ""
+                    text_buffer = ""
+                    if pending:
+                        await self._send_long_text_if_present(event, pending)
+                elif mode == "short":
+                    chunks, remain, limit_reached = self._split_short_text_incremental(
+                        text_buffer,
+                        final=True,
+                        sent_chunks=short_chunks_sent,
+                    )
+                    await self._send_chunks(event, chunks)
+                    short_chunks_sent += len(chunks)
+                    text_buffer = ""
+                    if limit_reached and remain.strip():
+                        await self._send_long_text_if_present(event, remain)
+                else:
+                    pending = text_buffer.strip()
+                    text_buffer = ""
+                    if pending:
+                        await self._send_long_text_if_present(event, pending)
+
+                # Reset state for the next streamed segment after tool execution.
+                mode = None
+                short_chunks_sent = 0
                 continue
 
             for comp in chain.chain:
