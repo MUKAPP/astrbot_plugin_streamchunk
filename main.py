@@ -22,6 +22,7 @@ from astrbot.api.star import Context, Star, register
 class StreamChunkPlugin(Star):
     ORIGINAL_STREAMING_SUPPORT_KEY = "_streamchunk_original_support_streaming_message"
     PLATFORM_META_PATCHED_KEY = "_streamchunk_platform_meta_patched"
+    TOOL_START_COUNT_KEY = "_streamchunk_tool_start_count"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     TAG_SEARCH_PATTERN = re.compile(r"\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
@@ -183,6 +184,30 @@ class StreamChunkPlugin(Star):
         ):
             return False
         return True
+
+    def _get_tool_start_count(self, event: AstrMessageEvent) -> int:
+        return self._as_int(
+            event.get_extra(self.TOOL_START_COUNT_KEY, 0),
+            0,
+            min_value=0,
+        )
+
+    @filter.on_using_llm_tool(priority=100)
+    async def on_using_llm_tool(
+        self,
+        event: AstrMessageEvent,
+        tool: Any,
+        tool_args: dict[str, Any] | None,
+    ):
+        _ = tool
+        _ = tool_args
+        if not self._should_handle_event(event):
+            return
+
+        event.set_extra(
+            self.TOOL_START_COUNT_KEY,
+            self._get_tool_start_count(event) + 1,
+        )
 
     @filter.on_waiting_llm_request(priority=100)
     async def on_waiting_llm_request(self, event: AstrMessageEvent):
@@ -477,8 +502,28 @@ class StreamChunkPlugin(Star):
         prefix_buffer = ""
         text_buffer = ""
         short_chunks_sent = 0
+        seen_tool_start_count = self._get_tool_start_count(event)
 
         async for chain in generator:
+            current_tool_start_count = self._get_tool_start_count(event)
+            if current_tool_start_count > seen_tool_start_count:
+                pending = self._collect_buffered_break_text(
+                    mode,
+                    prefix_buffer,
+                    text_buffer,
+                )
+                if pending:
+                    logger.info(
+                        "streamchunk: 检测到工具调用边界，先发送工具前缓冲文本。"
+                    )
+                    if not await self._send_forward_message(event, pending):
+                        await event.send(MessageChain([Plain(pending)]))
+                mode = None
+                prefix_buffer = ""
+                text_buffer = ""
+                short_chunks_sent = 0
+                seen_tool_start_count = current_tool_start_count
+
             if not isinstance(chain, MessageChain):
                 continue
 
@@ -505,6 +550,7 @@ class StreamChunkPlugin(Star):
                 # Reset state for the next streamed segment after tool execution.
                 mode = None
                 short_chunks_sent = 0
+                seen_tool_start_count = self._get_tool_start_count(event)
                 continue
 
             for comp in chain.chain:
