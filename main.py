@@ -4,7 +4,7 @@ import asyncio
 import re
 from collections.abc import AsyncGenerator
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType, filter
@@ -23,6 +23,7 @@ class StreamChunkPlugin(Star):
     ORIGINAL_STREAMING_SUPPORT_KEY = "_streamchunk_original_support_streaming_message"
     PLATFORM_META_PATCHED_KEY = "_streamchunk_platform_meta_patched"
     TOOL_START_COUNT_KEY = "_streamchunk_tool_start_count"
+    TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     TAG_SEARCH_PATTERN = re.compile(r"\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
@@ -208,6 +209,14 @@ class StreamChunkPlugin(Star):
             self.TOOL_START_COUNT_KEY,
             self._get_tool_start_count(event) + 1,
         )
+
+        flush_callback = cast(
+            Any,
+            event.get_extra(self.TOOL_BOUNDARY_FLUSH_CALLBACK_KEY, None),
+        )
+        if callable(flush_callback):
+            await cast(Any, flush_callback)()
+            await asyncio.sleep(0)
 
     @filter.on_waiting_llm_request(priority=100)
     async def on_waiting_llm_request(self, event: AstrMessageEvent):
@@ -504,173 +513,175 @@ class StreamChunkPlugin(Star):
         short_chunks_sent = 0
         seen_tool_start_count = self._get_tool_start_count(event)
 
-        async for chain in generator:
-            current_tool_start_count = self._get_tool_start_count(event)
-            if current_tool_start_count > seen_tool_start_count:
-                pending = self._collect_buffered_break_text(
-                    mode,
-                    prefix_buffer,
-                    text_buffer,
-                )
-                if pending:
-                    logger.info(
+        async def flush_tool_boundary_buffer(log_message: str) -> None:
+            nonlocal mode, prefix_buffer, text_buffer, short_chunks_sent, seen_tool_start_count
+
+            pending = self._collect_buffered_break_text(
+                mode,
+                prefix_buffer,
+                text_buffer,
+            )
+            if pending:
+                logger.info(log_message)
+                if not await self._send_forward_message(event, pending):
+                    await event.send(MessageChain([Plain(pending)]))
+
+            mode = None
+            prefix_buffer = ""
+            text_buffer = ""
+            short_chunks_sent = 0
+            seen_tool_start_count = self._get_tool_start_count(event)
+
+        async def flush_on_tool_start() -> None:
+            await flush_tool_boundary_buffer(
+                "streamchunk: 检测到工具开始事件，立即发送工具前缓冲文本。"
+            )
+
+        event.set_extra(self.TOOL_BOUNDARY_FLUSH_CALLBACK_KEY, flush_on_tool_start)
+
+        try:
+            async for chain in generator:
+                current_tool_start_count = self._get_tool_start_count(event)
+                if current_tool_start_count > seen_tool_start_count:
+                    await flush_tool_boundary_buffer(
                         "streamchunk: 检测到工具调用边界，先发送工具前缓冲文本。"
                     )
-                    if not await self._send_forward_message(event, pending):
-                        await event.send(MessageChain([Plain(pending)]))
-                mode = None
-                prefix_buffer = ""
-                text_buffer = ""
-                short_chunks_sent = 0
-                seen_tool_start_count = current_tool_start_count
 
-            if not isinstance(chain, MessageChain):
-                continue
+                if not isinstance(chain, MessageChain):
+                    continue
 
-            if chain.type == "break":
-                # Agent inserts a break before starting tool execution.
-                # Send buffered pre-tool text separately and reset aggregation state.
-                pending = self._collect_buffered_break_text(
-                    mode,
-                    prefix_buffer,
-                    text_buffer,
-                )
-                if pending:
-                    logger.info(
-                        "streamchunk: got stream break, sending buffered pre-tool text separately."
+                if chain.type == "break":
+                    # Agent inserts a break before starting tool execution.
+                    # Send buffered pre-tool text separately and reset aggregation state.
+                    await flush_tool_boundary_buffer(
+                        "streamchunk: 收到流式 break，发送工具前缓冲文本。"
                     )
-                    if not await self._send_forward_message(event, pending):
-                        await event.send(MessageChain([Plain(pending)]))
-                else:
-                    logger.info("streamchunk: got stream break with no buffered text.")
+                    continue
 
-                prefix_buffer = ""
-                text_buffer = ""
+                for comp in chain.chain:
+                    if not isinstance(comp, Plain):
+                        if mode is None and prefix_buffer.strip():
+                            mode = self.default_mode_no_tag
+                            if mode == "auto":
+                                mode = (
+                                    "short"
+                                    if len(prefix_buffer) <= self.auto_short_max_chars
+                                    else "long"
+                                )
+                            text_buffer += prefix_buffer
+                            prefix_buffer = ""
 
-                # Reset state for the next streamed segment after tool execution.
-                mode = None
-                short_chunks_sent = 0
-                seen_tool_start_count = self._get_tool_start_count(event)
-                continue
-
-            for comp in chain.chain:
-                if not isinstance(comp, Plain):
-                    if mode is None and prefix_buffer.strip():
-                        mode = self.default_mode_no_tag
                         if mode == "auto":
                             mode = (
                                 "short"
-                                if len(prefix_buffer) <= self.auto_short_max_chars
+                                if len(text_buffer) <= self.auto_short_max_chars
                                 else "long"
                             )
-                        text_buffer += prefix_buffer
-                        prefix_buffer = ""
 
-                    if mode == "auto":
-                        mode = (
-                            "short"
-                            if len(text_buffer) <= self.auto_short_max_chars
-                            else "long"
-                        )
+                        if mode is not None:
+                            text_buffer = await self._flush_text_buffer(
+                                event,
+                                mode,
+                                text_buffer,
+                                final=True,
+                            )
 
-                    if mode is not None:
-                        text_buffer = await self._flush_text_buffer(
-                            event,
-                            mode,
-                            text_buffer,
-                            final=True,
-                        )
-
-                    await event.send(MessageChain([comp]))
-                    continue
-
-                incoming = comp.text
-                if not incoming:
-                    continue
-
-                logger.debug(f"streamchunk: 当前流式获取到片段 -> '{incoming}'")
-
-                if mode is None:
-                    prefix_buffer += incoming
-                    mode_candidate, remaining, need_more = (
-                        self._detect_mode_from_prefix(
-                            prefix_buffer,
-                        )
-                    )
-                    if need_more:
+                        await event.send(MessageChain([comp]))
                         continue
-                    mode = mode_candidate
-                    if mode is not None:
-                        logger.info(
-                            f"streamchunk: 从模型输出流提取到响应模式: [{mode.upper()}]"
-                        )
-                    prefix_buffer = ""
-                    incoming = remaining
+
+                    incoming = comp.text
                     if not incoming:
                         continue
 
-                text_buffer += incoming
+                    logger.debug(f"streamchunk: 当前流式获取到片段 -> '{incoming}'")
 
-                if mode == "auto":
-                    if len(text_buffer) > self.auto_short_max_chars:
-                        mode = "long"
-                    # 这里保持缓冲，不进行 flush
-
-                if mode == "short":
-                    chunks, remain, limit_reached = self._split_short_text_incremental(
-                        text_buffer,
-                        final=False,
-                        sent_chunks=short_chunks_sent,
-                    )
-                    await self._send_chunks(event, chunks)
-                    short_chunks_sent += len(chunks)
-                    text_buffer = remain
-                    if limit_reached:
-                        logger.info(
-                            "streamchunk: SHORT 模式分段达到上限，剩余内容切换为整段发送。"
+                    if mode is None:
+                        prefix_buffer += incoming
+                        mode_candidate, remaining, need_more = (
+                            self._detect_mode_from_prefix(
+                                prefix_buffer,
+                            )
                         )
-                        mode = "long"
+                        if need_more:
+                            continue
+                        mode = mode_candidate
+                        if mode is not None:
+                            logger.info(
+                                f"streamchunk: 从模型输出流提取到响应模式: [{mode.upper()}]"
+                            )
+                        prefix_buffer = ""
+                        incoming = remaining
+                        if not incoming:
+                            continue
 
-        if mode is None:
-            mode_candidate, remaining, need_more = self._detect_mode_from_prefix(
-                prefix_buffer
-            )
-            if need_more:
-                remaining = prefix_buffer
-            mode = mode_candidate or self.default_mode_no_tag
+                    text_buffer += incoming
+
+                    if mode == "auto":
+                        if len(text_buffer) > self.auto_short_max_chars:
+                            mode = "long"
+                        # 这里保持缓冲，不进行 flush
+
+                    if mode == "short":
+                        chunks, remain, limit_reached = (
+                            self._split_short_text_incremental(
+                                text_buffer,
+                                final=False,
+                                sent_chunks=short_chunks_sent,
+                            )
+                        )
+                        await self._send_chunks(event, chunks)
+                        short_chunks_sent += len(chunks)
+                        text_buffer = remain
+                        if limit_reached:
+                            logger.info(
+                                "streamchunk: SHORT 模式分段达到上限，剩余内容切换为整段发送。"
+                            )
+                            mode = "long"
+
+            if mode is None:
+                mode_candidate, remaining, need_more = self._detect_mode_from_prefix(
+                    prefix_buffer
+                )
+                if need_more:
+                    remaining = prefix_buffer
+                mode = mode_candidate or self.default_mode_no_tag
+                if mode == "auto":
+                    mode = (
+                        "short"
+                        if len(prefix_buffer) <= self.auto_short_max_chars
+                        else "long"
+                    )
+                text_buffer += remaining
+            elif prefix_buffer:
+                text_buffer += prefix_buffer
+
             if mode == "auto":
                 mode = (
-                    "short"
-                    if len(prefix_buffer) <= self.auto_short_max_chars
-                    else "long"
+                    "short" if len(text_buffer) <= self.auto_short_max_chars else "long"
                 )
-            text_buffer += remaining
-        elif prefix_buffer:
-            text_buffer += prefix_buffer
 
-        if mode == "auto":
-            mode = "short" if len(text_buffer) <= self.auto_short_max_chars else "long"
+            if mode not in {"short", "long"}:
+                mode = "long"
 
-        if mode not in {"short", "long"}:
-            mode = "long"
-
-        logger.info(
-            f"streamchunk: 流式返回处理完毕，最终采取发送模式: [{mode.upper()}]"
-        )
-        if mode == "short":
-            chunks, remain, limit_reached = self._split_short_text_incremental(
-                text_buffer,
-                final=True,
-                sent_chunks=short_chunks_sent,
+            logger.info(
+                f"streamchunk: 流式返回处理完毕，最终采取发送模式: [{mode.upper()}]"
             )
-            await self._send_chunks(event, chunks)
-            if limit_reached and remain.strip():
-                logger.info(
-                    "streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。"
+            if mode == "short":
+                chunks, remain, limit_reached = self._split_short_text_incremental(
+                    text_buffer,
+                    final=True,
+                    sent_chunks=short_chunks_sent,
                 )
-                await self._send_long_text_if_present(event, remain)
-            return
-        await self._flush_text_buffer(event, mode, text_buffer, final=True)
+                await self._send_chunks(event, chunks)
+                if limit_reached and remain.strip():
+                    logger.info(
+                        "streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。"
+                    )
+                    await self._send_long_text_if_present(event, remain)
+                return
+            await self._flush_text_buffer(event, mode, text_buffer, final=True)
+        finally:
+            event.set_extra(self.TOOL_BOUNDARY_FLUSH_CALLBACK_KEY, None)
 
     @filter.on_decorating_result(priority=-100)
     async def on_decorating_result(self, event: AstrMessageEvent):
