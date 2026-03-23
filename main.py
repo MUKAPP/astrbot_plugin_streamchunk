@@ -23,6 +23,7 @@ class StreamChunkPlugin(Star):
     ORIGINAL_STREAMING_SUPPORT_KEY = "_streamchunk_original_support_streaming_message"
     PLATFORM_META_PATCHED_KEY = "_streamchunk_platform_meta_patched"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
+    TAG_SEARCH_PATTERN = re.compile(r"\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
     PROMPT_TEMPLATE = (
         "[STREAMCHUNK_LENGTH_TAG_RULE]\n"
@@ -231,13 +232,28 @@ class StreamChunkPlugin(Star):
         system_prompt += f"{self.PROMPT_TEMPLATE}\n"
         req.system_prompt = system_prompt
 
+    def _strip_leading_mode_tags(self, text: str) -> str:
+        cleaned = text.lstrip()
+        while True:
+            match = self.TAG_PATTERN.match(cleaned)
+            if not match:
+                return cleaned
+            cleaned = cleaned[match.end() :].lstrip()
+
     def _extract_mode(self, text: str) -> tuple[str | None, str]:
         match = self.TAG_PATTERN.match(text)
         if not match:
             return None, text
         mode = match.group(1).lower()
-        cleaned = text[match.end() :].lstrip()
+        cleaned = self._strip_leading_mode_tags(text[match.end() :])
         return mode, cleaned
+
+    def _extract_mode_from_leading_region(self, text: str) -> tuple[str | None, str]:
+        mode, cleaned = self._extract_mode(text)
+        if mode is not None:
+            return mode, cleaned
+
+        return None, text
 
     def _detect_mode_from_prefix(self, text: str) -> tuple[str | None, str, bool]:
         """Detect mode from stream prefix.
@@ -247,23 +263,23 @@ class StreamChunkPlugin(Star):
             remaining: text after removing tag if present
             need_more: True when tag parsing is still uncertain
         """
-        mode, cleaned = self._extract_mode(text)
-        if mode is not None:
-            return mode, cleaned, False
-
         stripped = text.lstrip()
         if stripped.startswith("<think>") and "</think>" not in text:
             return None, "", True
 
         if "</think>" in text:
             after_think = text.split("</think>", 1)[1]
-            mode, cleaned_after = self._extract_mode(after_think)
+            mode, cleaned_after = self._extract_mode_from_leading_region(after_think)
             if mode is not None:
                 cleaned_total = text[: text.rindex("</think>") + 8] + cleaned_after
                 return mode, cleaned_total, False
             if len(after_think) < self.TAG_DETECT_MAX_CHARS:
                 return None, "", True
             return self.default_mode_no_tag, text, False
+
+        mode, cleaned = self._extract_mode_from_leading_region(text)
+        if mode is not None:
+            return mode, cleaned, False
 
         if len(text) < self.TAG_DETECT_MAX_CHARS:
             return None, "", True
@@ -441,6 +457,17 @@ class StreamChunkPlugin(Star):
             return await self._send_long_text_if_present(event, text_buffer)
         return text_buffer
 
+    def _collect_buffered_break_text(
+        self,
+        mode: str | None,
+        prefix_buffer: str,
+        text_buffer: str,
+    ) -> str:
+        pending_prefix = prefix_buffer
+        if mode is None and pending_prefix:
+            _, pending_prefix = self._extract_mode_from_leading_region(pending_prefix)
+        return f"{pending_prefix}{text_buffer}".strip()
+
     async def _process_stream_locally(
         self,
         event: AstrMessageEvent,
@@ -457,33 +484,23 @@ class StreamChunkPlugin(Star):
 
             if chain.type == "break":
                 # Agent inserts a break before starting tool execution.
-                # Flush any pending user-visible text so it won't be delayed until tools finish.
-                logger.info(
-                    "streamchunk: got stream break, flushing buffered text before tool call."
+                # Send buffered pre-tool text separately and reset aggregation state.
+                pending = self._collect_buffered_break_text(
+                    mode,
+                    prefix_buffer,
+                    text_buffer,
                 )
-
-                if mode is None:
-                    pending = (prefix_buffer + text_buffer).strip()
-                    prefix_buffer = ""
-                    text_buffer = ""
-                    if pending:
-                        await self._send_long_text_if_present(event, pending)
-                elif mode == "short":
-                    chunks, remain, limit_reached = self._split_short_text_incremental(
-                        text_buffer,
-                        final=True,
-                        sent_chunks=short_chunks_sent,
+                if pending:
+                    logger.info(
+                        "streamchunk: got stream break, sending buffered pre-tool text separately."
                     )
-                    await self._send_chunks(event, chunks)
-                    short_chunks_sent += len(chunks)
-                    text_buffer = ""
-                    if limit_reached and remain.strip():
-                        await self._send_long_text_if_present(event, remain)
+                    if not await self._send_forward_message(event, pending):
+                        await event.send(MessageChain([Plain(pending)]))
                 else:
-                    pending = text_buffer.strip()
-                    text_buffer = ""
-                    if pending:
-                        await self._send_long_text_if_present(event, pending)
+                    logger.info("streamchunk: got stream break with no buffered text.")
+
+                prefix_buffer = ""
+                text_buffer = ""
 
                 # Reset state for the next streamed segment after tool execution.
                 mode = None
