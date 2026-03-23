@@ -1,6 +1,6 @@
 name: astrbot_plugin_streamchunk
 display_name: StreamChunk
 desc: 为不支持流式的平台提供流式消息缓冲和分段功能。
-version: v1.0.1
+version: v1.0.2
 author: MUKAPP
 repo: https://github.com/MUKAPP/astrbot_plugin_streamchunk
