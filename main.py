@@ -452,11 +452,10 @@ class StreamChunkPlugin(Star):
         total = len(chunks)
         for idx, chunk in enumerate(chunks):
             logger.info(
-                "streamchunk: 发送分段消息 %s/%s (len=%s): %s",
+                "streamchunk: 发送分段消息 %s/%s (len=%s)",
                 idx + 1,
                 total,
                 len(chunk),
-                chunk,
             )
             await event.send(MessageChain([Plain(chunk)]))
             if idx < len(chunks) - 1 and self.segment_interval_seconds > 0:
@@ -610,6 +609,7 @@ class StreamChunkPlugin(Star):
                     incoming = comp.text
                     if not incoming:
                         continue
+                    logger.debug("streamchunk: 收到流式文本片段 (len=%s)", len(incoming))
 
                     if discarding_thinking:
                         closing_index = incoming.find("</think>")
