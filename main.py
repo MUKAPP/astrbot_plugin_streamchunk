@@ -38,6 +38,7 @@ class StreamChunkPlugin(Star):
         "标签必须放在最前面，不要附带任何解释。"
     )
     TAG_DETECT_MAX_CHARS = 64
+    REPEATED_PUNCTUATION_CHARS = frozenset({"…", "—"})
     THINKING_BUFFER_MAX_CHARS = 4096
 
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -373,7 +374,11 @@ class StreamChunkPlugin(Star):
         while end < text_length:
             current = text[end]
             previous = text[end - 1] if end > start else ""
-            if self._is_grapheme_extend(current) or current == "\u200d":
+            if (
+                self._is_grapheme_extend(current)
+                or current == "\u200d"
+                or (current == previous and current in self.REPEATED_PUNCTUATION_CHARS)
+            ):
                 end += 1
                 continue
             if previous == "\u200d":
@@ -485,6 +490,12 @@ class StreamChunkPlugin(Star):
                     search_start = match.start() + 1
                     continue
                 if match.end() > max_end:
+                    break
+                if (
+                    not final
+                    and match.end() == text_length
+                    and match.group() in self.REPEATED_PUNCTUATION_CHARS
+                ):
                     break
                 split_end = self._safe_chunk_end(text, last_cut, match.end())
                 break
