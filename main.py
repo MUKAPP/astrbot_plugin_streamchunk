@@ -28,7 +28,6 @@ class StreamChunkPlugin(Star):
     TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
     LAST_SHORT_CHUNK_SENT_AT_KEY = "_streamchunk_last_short_chunk_sent_at"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
-    TAG_SEARCH_PATTERN = re.compile(r"\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
     PROMPT_TEMPLATE = (
         "[STREAMCHUNK_LENGTH_TAG_RULE]\n"
