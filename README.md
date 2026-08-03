@@ -21,8 +21,8 @@
 5. `inject_prompt`：向系统提示词注入标签规则。
 6. `default_mode_no_tag`：模型未输出标签时的回退模式，可选 `short` / `long` / `auto`。
 7. `auto_short_max_chars`：`auto` 模式的短消息字数阈值。
-8. `split_punctuations`：短消息分段触发正则（例如 `[。？！!?；;…\n]`）。
-9. `drop_punctuations`：分段后末尾命中该正则时丢弃末尾符号（例如 `[。.]`）。
+8. `split_punctuations`：短消息分段触发正则，支持跨字符匹配（例如 `\r\n`、`\.{3}`）。
+9. `drop_punctuations`：分段后末尾命中该正则时丢弃匹配内容，支持多字符匹配（例如 `\.{3}`）。
 10. `min_chunk_chars`：最小分段片段长度。达到该长度后，遇到分段标点才会切分。
 11. `max_chunk_chars`：最大分段片段长度。达到后强制切分。
 12. `max_short_chunks`：SHORT 模式最多分段数。超过后，剩余内容改为一次发送；`0` 表示不限制。
@@ -32,4 +32,5 @@
 - 标签只在回复开头识别，避免正文中出现 `[SHORT]` / `[LONG]` 时误判。
 - 在流式和非流式路径中，短消息分段规则保持一致。
 - 当 SHORT 模式分段数量达到 `max_short_chunks` 时，剩余内容会改为一次发送，并继续复用长文本与合并转发逻辑。
+- 强制切分会避免拆开常见组合字符、Emoji 修饰符、ZWJ 表情和国旗序列；单个字素过长时，实际长度可能略超过 `max_chunk_chars`。
 

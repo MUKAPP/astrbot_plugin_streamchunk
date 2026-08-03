@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any, cast
@@ -99,10 +100,10 @@ class StreamChunkPlugin(Star):
         )
         try:
             self.split_pattern = re.compile(split_punctuations)
-        except re.error as e:
-            logger.error(
-                f"streamchunk: 分段标点正则表达式编译失败: {e}，将回退到默认设置"
-            )
+            if self.split_pattern.search("") is not None:
+                raise ValueError("分段正则不能匹配空字符串")
+        except (re.error, ValueError) as e:
+            logger.error(f"streamchunk: 分段标点正则表达式无效: {e}，将回退到默认设置")
             self.split_pattern = re.compile(r"[。？！!?；;…\n]")
 
         drop_punctuations = str(
@@ -110,9 +111,11 @@ class StreamChunkPlugin(Star):
         )
         try:
             self.drop_pattern = re.compile(drop_punctuations)
-        except re.error as e:
+            if self.drop_pattern.search("") is not None:
+                raise ValueError("丢弃正则不能匹配空字符串")
+        except (re.error, ValueError) as e:
             logger.error(
-                f"streamchunk: 丢弃分段符号正则表达式编译失败: {e}，将回退到默认设置"
+                f"streamchunk: 丢弃分段符号正则表达式无效: {e}，将回退到默认设置"
             )
             self.drop_pattern = re.compile(r"[。.]")
 
@@ -348,12 +351,58 @@ class StreamChunkPlugin(Star):
             return self.default_mode_no_tag
         return "short" if len(text) <= self.auto_short_max_chars else "long"
 
+    @staticmethod
+    def _is_grapheme_extend(char: str) -> bool:
+        return (
+            unicodedata.combining(char) != 0
+            or "\ufe00" <= char <= "\ufe0f"
+            or "\U000e0100" <= char <= "\U000e01ef"
+            or "\U0001f3fb" <= char <= "\U0001f3ff"
+        )
+
+    @staticmethod
+    def _is_regional_indicator(char: str) -> bool:
+        return "\U0001f1e6" <= char <= "\U0001f1ff"
+
+    def _safe_chunk_end(self, text: str, start: int, end: int) -> int:
+        """Avoid splitting common Unicode grapheme clusters at a hard boundary."""
+        text_length = len(text)
+        if end >= text_length:
+            return text_length
+
+        while end < text_length:
+            current = text[end]
+            previous = text[end - 1] if end > start else ""
+            if self._is_grapheme_extend(current) or current == "\u200d":
+                end += 1
+                continue
+            if previous == "\u200d":
+                end += 1
+                continue
+            if self._is_regional_indicator(current):
+                regional_count = 0
+                cursor = end - 1
+                while cursor >= start and self._is_regional_indicator(text[cursor]):
+                    regional_count += 1
+                    cursor -= 1
+                if regional_count % 2 == 1:
+                    end += 1
+                    continue
+            break
+
+        return end
+
     def _normalize_chunk(self, text: str) -> str:
         chunk = text.strip()
         if not chunk:
             return ""
-        if self.drop_pattern.search(chunk[-1]):
-            chunk = chunk[:-1].strip()
+
+        suffix_match = None
+        for match in self.drop_pattern.finditer(chunk):
+            if match.start() < match.end() and match.end() == len(chunk):
+                suffix_match = match
+        if suffix_match is not None:
+            chunk = chunk[: suffix_match.start()].strip()
         return chunk
 
     def _get_forward_threshold(self, event: AstrMessageEvent) -> int:
@@ -418,25 +467,42 @@ class StreamChunkPlugin(Star):
 
         chunks: list[str] = []
         last_cut = 0
+        text_length = len(text)
 
-        for idx, char in enumerate(text, start=1):
-            seg_len = idx - last_cut
-            should_cut = False
-            if self.split_pattern.search(char) and seg_len >= self.min_chunk_chars:
-                should_cut = True
-            elif seg_len >= self.max_chunk_chars:
-                should_cut = True
+        while last_cut < text_length:
+            max_end = min(last_cut + self.max_chunk_chars, text_length)
+            search_start = last_cut
+            split_end: int | None = None
 
-            if should_cut:
-                part = self._normalize_chunk(text[last_cut:idx])
-                if part:
-                    chunks.append(part)
-                last_cut = idx
-                if (
-                    self.max_short_chunks > 0
-                    and sent_chunks + len(chunks) >= self.max_short_chunks
-                ):
-                    return chunks, text[last_cut:], True
+            while search_start < text_length:
+                match = self.split_pattern.search(text, search_start)
+                if match is None:
+                    break
+                if match.start() == match.end():
+                    search_start = match.end() + 1
+                    continue
+                if match.end() - last_cut < self.min_chunk_chars:
+                    search_start = match.start() + 1
+                    continue
+                if match.end() > max_end:
+                    break
+                split_end = self._safe_chunk_end(text, last_cut, match.end())
+                break
+
+            if split_end is None:
+                if text_length - last_cut < self.max_chunk_chars:
+                    break
+                split_end = self._safe_chunk_end(text, last_cut, max_end)
+
+            part = self._normalize_chunk(text[last_cut:split_end])
+            if part:
+                chunks.append(part)
+            last_cut = split_end
+            if (
+                self.max_short_chunks > 0
+                and sent_chunks + len(chunks) >= self.max_short_chunks
+            ):
+                return chunks, text[last_cut:], True
 
         remain = text[last_cut:]
         if final and remain.strip():
