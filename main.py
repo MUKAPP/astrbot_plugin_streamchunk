@@ -24,6 +24,7 @@ class StreamChunkPlugin(Star):
     PLATFORM_META_PATCHED_KEY = "_streamchunk_platform_meta_patched"
     TOOL_START_COUNT_KEY = "_streamchunk_tool_start_count"
     TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
+    LAST_SHORT_CHUNK_SENT_AT_KEY = "_streamchunk_last_short_chunk_sent_at"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     TAG_SEARCH_PATTERN = re.compile(r"\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
@@ -450,7 +451,19 @@ class StreamChunkPlugin(Star):
 
     async def _send_chunks(self, event: AstrMessageEvent, chunks: list[str]) -> None:
         total = len(chunks)
+        loop = asyncio.get_running_loop()
         for idx, chunk in enumerate(chunks):
+            if self.segment_interval_seconds > 0:
+                last_sent_at = event.get_extra(
+                    self.LAST_SHORT_CHUNK_SENT_AT_KEY,
+                    None,
+                )
+                if isinstance(last_sent_at, (int, float)):
+                    elapsed = loop.time() - last_sent_at
+                    remaining_interval = self.segment_interval_seconds - elapsed
+                    if remaining_interval > 0:
+                        await asyncio.sleep(remaining_interval)
+
             logger.info(
                 "streamchunk: 发送分段消息 %s/%s (len=%s)",
                 idx + 1,
@@ -458,8 +471,7 @@ class StreamChunkPlugin(Star):
                 len(chunk),
             )
             await event.send(MessageChain([Plain(chunk)]))
-            if idx < len(chunks) - 1 and self.segment_interval_seconds > 0:
-                await asyncio.sleep(self.segment_interval_seconds)
+            event.set_extra(self.LAST_SHORT_CHUNK_SENT_AT_KEY, loop.time())
 
     async def _send_long_text_if_present(
         self,
@@ -506,9 +518,7 @@ class StreamChunkPlugin(Star):
                 if closing_index == -1:
                     pending_prefix = ""
                 else:
-                    pending_prefix = stripped_prefix[
-                        closing_index + len("</think>") :
-                    ]
+                    pending_prefix = stripped_prefix[closing_index + len("</think>") :]
             _, pending_prefix = self._extract_mode(pending_prefix)
         return f"{pending_prefix}{text_buffer}".strip()
 
@@ -609,7 +619,9 @@ class StreamChunkPlugin(Star):
                     incoming = comp.text
                     if not incoming:
                         continue
-                    logger.debug("streamchunk: 收到流式文本片段 (len=%s)", len(incoming))
+                    logger.debug(
+                        "streamchunk: 收到流式文本片段 (len=%s)", len(incoming)
+                    )
 
                     if discarding_thinking:
                         closing_index = incoming.find("</think>")
@@ -718,6 +730,7 @@ class StreamChunkPlugin(Star):
             await self._flush_text_buffer(event, mode, text_buffer, final=True)
         finally:
             event.set_extra(self.TOOL_BOUNDARY_FLUSH_CALLBACK_KEY, None)
+            self._restore_event_streaming_pipeline(event)
 
     @filter.on_decorating_result(priority=-100)
     async def on_decorating_result(self, event: AstrMessageEvent):
