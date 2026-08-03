@@ -18,7 +18,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_streamchunk",
     "MUKAPP",
     "Smart chunk sender for platforms without native streaming support.",
-    "1.0.3",
+    "1.0.4",
 )
 class StreamChunkPlugin(Star):
     ORIGINAL_STREAMING_SUPPORT_KEY = "_streamchunk_original_support_streaming_message"
