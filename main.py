@@ -35,6 +35,7 @@ class StreamChunkPlugin(Star):
         "标签必须放在最前面，不要附带任何解释。"
     )
     TAG_DETECT_MAX_CHARS = 64
+    THINKING_BUFFER_MAX_CHARS = 4096
 
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -275,19 +276,20 @@ class StreamChunkPlugin(Star):
             cleaned = cleaned[match.end() :].lstrip()
 
     def _extract_mode(self, text: str) -> tuple[str | None, str]:
-        match = self.TAG_PATTERN.match(text)
+        text_without_thinking = text
+        stripped = text.lstrip()
+        if stripped.startswith("<think>"):
+            closing_index = stripped.find("</think>")
+            if closing_index == -1:
+                return None, ""
+            text_without_thinking = stripped[closing_index + len("</think>") :].lstrip()
+
+        match = self.TAG_PATTERN.match(text_without_thinking)
         if not match:
-            return None, text
+            return None, text_without_thinking
         mode = match.group(1).lower()
-        cleaned = self._strip_leading_mode_tags(text[match.end() :])
+        cleaned = self._strip_leading_mode_tags(text_without_thinking[match.end() :])
         return mode, cleaned
-
-    def _extract_mode_from_leading_region(self, text: str) -> tuple[str | None, str]:
-        mode, cleaned = self._extract_mode(text)
-        if mode is not None:
-            return mode, cleaned
-
-        return None, text
 
     def _detect_mode_from_prefix(self, text: str) -> tuple[str | None, str, bool]:
         """Detect mode from stream prefix.
@@ -298,20 +300,20 @@ class StreamChunkPlugin(Star):
             need_more: True when tag parsing is still uncertain
         """
         stripped = text.lstrip()
-        if stripped.startswith("<think>") and "</think>" not in text:
-            return None, "", True
-
-        if "</think>" in text:
-            after_think = text.split("</think>", 1)[1]
-            mode, cleaned_after = self._extract_mode_from_leading_region(after_think)
-            if mode is not None:
-                cleaned_total = text[: text.rindex("</think>") + 8] + cleaned_after
-                return mode, cleaned_total, False
-            if len(after_think) < self.TAG_DETECT_MAX_CHARS:
+        if stripped.startswith("<think>"):
+            closing_index = stripped.find("</think>")
+            if closing_index == -1:
                 return None, "", True
-            return self.default_mode_no_tag, text, False
 
-        mode, cleaned = self._extract_mode_from_leading_region(text)
+            after_thinking = stripped[closing_index + len("</think>") :]
+            mode, cleaned_after = self._extract_mode(after_thinking)
+            if mode is not None:
+                return mode, cleaned_after, False
+            if len(after_thinking) < self.TAG_DETECT_MAX_CHARS:
+                return None, "", True
+            return self.default_mode_no_tag, after_thinking, False
+
+        mode, cleaned = self._extract_mode(text)
         if mode is not None:
             return mode, cleaned, False
 
@@ -499,7 +501,16 @@ class StreamChunkPlugin(Star):
     ) -> str:
         pending_prefix = prefix_buffer
         if mode is None and pending_prefix:
-            _, pending_prefix = self._extract_mode_from_leading_region(pending_prefix)
+            stripped_prefix = pending_prefix.lstrip()
+            if stripped_prefix.startswith("<think>"):
+                closing_index = stripped_prefix.find("</think>")
+                if closing_index == -1:
+                    pending_prefix = ""
+                else:
+                    pending_prefix = stripped_prefix[
+                        closing_index + len("</think>") :
+                    ]
+            _, pending_prefix = self._extract_mode(pending_prefix)
         return f"{pending_prefix}{text_buffer}".strip()
 
     async def _process_stream_locally(
@@ -511,10 +522,12 @@ class StreamChunkPlugin(Star):
         prefix_buffer = ""
         text_buffer = ""
         short_chunks_sent = 0
+        discarding_thinking = False
         seen_tool_start_count = self._get_tool_start_count(event)
 
         async def flush_tool_boundary_buffer(log_message: str) -> None:
-            nonlocal mode, prefix_buffer, text_buffer, short_chunks_sent, seen_tool_start_count
+            nonlocal mode, prefix_buffer, text_buffer, short_chunks_sent
+            nonlocal discarding_thinking, seen_tool_start_count
 
             pending = self._collect_buffered_break_text(
                 mode,
@@ -530,6 +543,7 @@ class StreamChunkPlugin(Star):
             prefix_buffer = ""
             text_buffer = ""
             short_chunks_sent = 0
+            discarding_thinking = False
             seen_tool_start_count = self._get_tool_start_count(event)
 
         async def flush_on_tool_start() -> None:
@@ -568,7 +582,11 @@ class StreamChunkPlugin(Star):
                                     if len(prefix_buffer) <= self.auto_short_max_chars
                                     else "long"
                                 )
-                            text_buffer += prefix_buffer
+                            text_buffer += self._collect_buffered_break_text(
+                                mode=None,
+                                prefix_buffer=prefix_buffer,
+                                text_buffer="",
+                            )
                             prefix_buffer = ""
 
                         if mode == "auto":
@@ -593,7 +611,14 @@ class StreamChunkPlugin(Star):
                     if not incoming:
                         continue
 
-                    logger.debug(f"streamchunk: 当前流式获取到片段 -> '{incoming}'")
+                    if discarding_thinking:
+                        closing_index = incoming.find("</think>")
+                        if closing_index == -1:
+                            continue
+                        discarding_thinking = False
+                        incoming = incoming[closing_index + len("</think>") :]
+                        if not incoming:
+                            continue
 
                     if mode is None:
                         prefix_buffer += incoming
@@ -603,6 +628,15 @@ class StreamChunkPlugin(Star):
                             )
                         )
                         if need_more:
+                            if (
+                                prefix_buffer.lstrip().startswith("<think>")
+                                and len(prefix_buffer) > self.THINKING_BUFFER_MAX_CHARS
+                            ):
+                                logger.warning(
+                                    "streamchunk: 未闭合的思考内容超过缓冲上限，已丢弃。"
+                                )
+                                prefix_buffer = ""
+                                discarding_thinking = True
                             continue
                         mode = mode_candidate
                         if mode is not None:
@@ -639,6 +673,8 @@ class StreamChunkPlugin(Star):
                             mode = "long"
 
             if mode is None:
+                if discarding_thinking:
+                    prefix_buffer = ""
                 mode_candidate, remaining, need_more = self._detect_mode_from_prefix(
                     prefix_buffer
                 )
