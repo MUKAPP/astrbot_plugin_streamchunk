@@ -22,6 +22,8 @@ from astrbot.api.star import Context, Star, register
 class StreamChunkPlugin(Star):
     ORIGINAL_STREAMING_SUPPORT_KEY = "_streamchunk_original_support_streaming_message"
     PLATFORM_META_PATCHED_KEY = "_streamchunk_platform_meta_patched"
+    ORIGINAL_PLATFORM_META_KEY = "_streamchunk_original_platform_meta"
+    ORIGINAL_PLATFORM_ALIAS_KEY = "_streamchunk_original_platform_alias"
     TOOL_START_COUNT_KEY = "_streamchunk_tool_start_count"
     TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
     LAST_SHORT_CHUNK_SENT_AT_KEY = "_streamchunk_last_short_chunk_sent_at"
@@ -165,6 +167,8 @@ class StreamChunkPlugin(Star):
             getattr(event.platform_meta, "support_streaming_message", True),
         )
         event.set_extra(self.ORIGINAL_STREAMING_SUPPORT_KEY, original_support)
+        event.set_extra(self.ORIGINAL_PLATFORM_META_KEY, event.platform_meta)
+        event.set_extra(self.ORIGINAL_PLATFORM_ALIAS_KEY, event.platform)
 
         try:
             patched_meta = replace(event.platform_meta, support_streaming_message=True)
@@ -178,6 +182,23 @@ class StreamChunkPlugin(Star):
         # keep compatibility with event.platform alias
         event.platform = patched_meta
         event.set_extra(self.PLATFORM_META_PATCHED_KEY, True)
+
+    def _restore_event_streaming_pipeline(self, event: AstrMessageEvent) -> None:
+        if not event.get_extra(self.PLATFORM_META_PATCHED_KEY, False):
+            return
+
+        original_meta = event.get_extra(self.ORIGINAL_PLATFORM_META_KEY, None)
+        if original_meta is not None:
+            event.platform_meta = original_meta
+
+        original_platform = event.get_extra(self.ORIGINAL_PLATFORM_ALIAS_KEY, None)
+        if original_platform is not None:
+            event.platform = original_platform
+
+        event.set_extra(self.ORIGINAL_STREAMING_SUPPORT_KEY, None)
+        event.set_extra(self.ORIGINAL_PLATFORM_META_KEY, None)
+        event.set_extra(self.ORIGINAL_PLATFORM_ALIAS_KEY, None)
+        event.set_extra(self.PLATFORM_META_PATCHED_KEY, False)
 
     def _should_handle_event(self, event: AstrMessageEvent) -> bool:
         if not self.enabled:
