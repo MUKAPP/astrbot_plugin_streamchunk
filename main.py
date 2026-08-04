@@ -18,7 +18,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_streamchunk",
     "MUKAPP",
     "Smart chunk sender for platforms without native streaming support.",
-    "1.0.4",
+    "1.0.5",
 )
 class StreamChunkPlugin(Star):
     ORIGINAL_STREAMING_SUPPORT_KEY = "_streamchunk_original_support_streaming_message"
@@ -28,6 +28,7 @@ class StreamChunkPlugin(Star):
     TOOL_START_COUNT_KEY = "_streamchunk_tool_start_count"
     TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
     LAST_SHORT_CHUNK_SENT_AT_KEY = "_streamchunk_last_short_chunk_sent_at"
+    LLM_RESPONSE_RESTORE_KEY = "_streamchunk_llm_response_restore"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
     PROMPT_TEMPLATE = (
@@ -315,6 +316,110 @@ class StreamChunkPlugin(Star):
         mode = match.group(1).lower()
         cleaned = self._strip_leading_mode_tags(text_without_thinking[match.end() :])
         return mode, cleaned
+
+    def _strip_leading_control_tags(self, text: str) -> str:
+        """只移除回复开头的分段控制标签，保留其他文本。"""
+        if not self.TAG_PATTERN.match(text):
+            return text
+        return self._strip_leading_mode_tags(text)
+
+    def _strip_mode_tags_from_history(self, run_context: Any) -> None:
+        """从本轮待持久化的助手消息中移除分段控制标签。"""
+        messages = getattr(run_context, "messages", None)
+        if not isinstance(messages, list):
+            return
+
+        for message in reversed(messages):
+            if getattr(message, "role", None) != "assistant":
+                continue
+
+            parts = getattr(message, "content", None)
+            if not isinstance(parts, list):
+                return
+
+            first_text_index = 0
+            while (
+                first_text_index < len(parts)
+                and getattr(parts[first_text_index], "type", None) == "think"
+            ):
+                first_text_index += 1
+
+            if (
+                first_text_index >= len(parts)
+                or getattr(parts[first_text_index], "type", None) != "text"
+            ):
+                return
+
+            end_index = first_text_index
+            text_parts = []
+            while (
+                end_index < len(parts)
+                and getattr(parts[end_index], "type", None) == "text"
+            ):
+                text_parts.append(parts[end_index])
+                end_index += 1
+
+            text = "".join(part.text for part in text_parts)
+            cleaned = self._strip_leading_control_tags(text)
+            if cleaned == text:
+                return
+
+            text_parts[0].text = cleaned
+            del parts[first_text_index + 1 : end_index]
+            return
+
+    def _restore_llm_response(self, event: AstrMessageEvent, response: Any) -> None:
+        """恢复仅为平台历史清理而临时改写的模型响应。"""
+        restore_data = event.get_extra(self.LLM_RESPONSE_RESTORE_KEY, None)
+        event.set_extra(self.LLM_RESPONSE_RESTORE_KEY, None)
+        if not isinstance(restore_data, tuple) or restore_data[0] is not response:
+            return
+
+        original_chain, original_components, original_text = restore_data[1:]
+        if original_chain is None:
+            response.completion_text = original_text
+            return
+
+        response.result_chain = original_chain
+        original_chain.chain[:] = original_components
+
+    @filter.on_llm_response(priority=100)
+    async def on_llm_response(self, event: AstrMessageEvent, response: Any):
+        """临时移除标签，避免平台群聊历史保存控制文本。"""
+        if not self._should_handle_event(event):
+            return
+
+        text = getattr(response, "completion_text", None)
+        if not isinstance(text, str):
+            return
+
+        cleaned = self._strip_leading_control_tags(text)
+        if cleaned == text:
+            return
+
+        original_chain = getattr(response, "result_chain", None)
+        original_components = (
+            list(original_chain.chain) if original_chain is not None else None
+        )
+        event.set_extra(
+            self.LLM_RESPONSE_RESTORE_KEY,
+            (response, original_chain, original_components, text),
+        )
+        response.completion_text = cleaned
+
+    @filter.on_agent_done(priority=100)
+    async def on_agent_done(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: Any,
+    ):
+        """清理内部会话历史后恢复用于发送的完整模型响应。"""
+        try:
+            if self._should_handle_event(event):
+                self._strip_mode_tags_from_history(run_context)
+        finally:
+            self._restore_llm_response(event, response)
 
     def _detect_mode_from_prefix(self, text: str) -> tuple[str | None, str, bool]:
         """Detect mode from stream prefix.
