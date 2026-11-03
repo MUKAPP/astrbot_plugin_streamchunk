@@ -277,9 +277,11 @@ class StreamChunkPlugin(Star):
 
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """Inject [SHORT]/[LONG] rule ahead of LLM request."""
+        """清理历史控制标签，并按配置注入本轮标签规则。"""
         if not self._should_handle_event(event):
             return
+
+        self._strip_mode_tags_from_contexts(req.contexts)
 
         if not self.inject_prompt:
             return
@@ -323,19 +325,84 @@ class StreamChunkPlugin(Star):
             return text
         return self._strip_leading_mode_tags(text)
 
+    def _strip_mode_tags_from_contexts(self, contexts: list[dict[str, Any]]) -> None:
+        """清理请求中已存在的助手标签，不改写用户和工具消息。"""
+        for message_index in range(len(contexts) - 1, -1, -1):
+            message = contexts[message_index]
+            if message.get("role") != "assistant":
+                continue
+
+            content = message.get("content")
+            if isinstance(content, str):
+                cleaned = self._strip_leading_control_tags(content)
+                if cleaned != content:
+                    if cleaned or message.get("tool_calls"):
+                        message["content"] = cleaned
+                    else:
+                        del contexts[message_index]
+                continue
+            if not isinstance(content, list):
+                continue
+
+            first_text_index = 0
+            while (
+                first_text_index < len(content)
+                and content[first_text_index].get("type") == "think"
+            ):
+                first_text_index += 1
+
+            end_index = first_text_index
+            while (
+                end_index < len(content)
+                and content[end_index].get("type") == "text"
+            ):
+                end_index += 1
+            if end_index == first_text_index:
+                continue
+
+            text = "".join(
+                content[index]["text"]
+                for index in range(first_text_index, end_index)
+            )
+            cleaned = self._strip_leading_control_tags(text)
+            removed_chars = len(text) - len(cleaned)
+            if not removed_chars:
+                continue
+
+            index = first_text_index
+            while index < end_index and removed_chars:
+                part = content[index]
+                if removed_chars < len(part["text"]):
+                    part["text"] = part["text"][removed_chars:]
+                    break
+                removed_chars -= len(part["text"])
+                index += 1
+            del content[first_text_index:index]
+            if not content and not message.get("tool_calls"):
+                del contexts[message_index]
+
     def _strip_mode_tags_from_history(self, run_context: Any) -> None:
-        """从本轮待持久化的助手消息中移除分段控制标签。"""
+        """从待持久化的全部助手消息中移除分段控制标签。"""
         messages = getattr(run_context, "messages", None)
         if not isinstance(messages, list):
             return
 
-        for message in reversed(messages):
+        for message_index in range(len(messages) - 1, -1, -1):
+            message = messages[message_index]
             if getattr(message, "role", None) != "assistant":
                 continue
 
             parts = getattr(message, "content", None)
+            if isinstance(parts, str):
+                cleaned = self._strip_leading_control_tags(parts)
+                if cleaned != parts:
+                    if cleaned or getattr(message, "tool_calls", None):
+                        message.content = cleaned
+                    else:
+                        del messages[message_index]
+                continue
             if not isinstance(parts, list):
-                return
+                continue
 
             first_text_index = 0
             while (
@@ -348,7 +415,7 @@ class StreamChunkPlugin(Star):
                 first_text_index >= len(parts)
                 or getattr(parts[first_text_index], "type", None) != "text"
             ):
-                return
+                continue
 
             end_index = first_text_index
             text_parts = []
@@ -362,11 +429,20 @@ class StreamChunkPlugin(Star):
             text = "".join(part.text for part in text_parts)
             cleaned = self._strip_leading_control_tags(text)
             if cleaned == text:
-                return
+                continue
 
-            text_parts[0].text = cleaned
-            del parts[first_text_index + 1 : end_index]
-            return
+            removed_chars = len(text) - len(cleaned)
+            index = first_text_index
+            while index < end_index and removed_chars:
+                part = parts[index]
+                if removed_chars < len(part.text):
+                    part.text = part.text[removed_chars:]
+                    break
+                removed_chars -= len(part.text)
+                index += 1
+            del parts[first_text_index:index]
+            if not parts and not getattr(message, "tool_calls", None):
+                del messages[message_index]
 
     def _restore_llm_response(self, event: AstrMessageEvent, response: Any) -> None:
         """恢复仅为平台历史清理而临时改写的模型响应。"""
