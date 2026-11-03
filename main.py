@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import unicodedata
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import replace
 from typing import Any, cast
 
@@ -29,16 +29,20 @@ class StreamChunkPlugin(Star):
     TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
     LAST_SHORT_CHUNK_SENT_AT_KEY = "_streamchunk_last_short_chunk_sent_at"
     LLM_RESPONSE_RESTORE_KEY = "_streamchunk_llm_response_restore"
+    STREAM_PATCHED_KEY = "_streamchunk_stream_patched"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
+    THINKING_OPEN_TAG = "<think>"
+    THINKING_CLOSE_TAG = "</think>"
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
     PROMPT_TEMPLATE = (
         "[STREAMCHUNK_LENGTH_TAG_RULE]\n"
         "你必须在回复开始前输出一个系统标签：[SHORT] 或 [LONG]。\n"
-        "【[SHORT] 使用条件】你打算回复的字数在100字以下时使用，会被系统分为多条消息发送，更像人们的聊天风格。例如日常闲聊时使用 [SHORT]。\n"
-        "【[LONG] 使用条件】你打算回复的字数在150字以上时使用，只会发送一条消息，避免消息太多刷屏。例如你的回复是一篇短文、文章、代码、包含多个列表项或者是长段落时使用 [LONG]。\n"
+        "【[SHORT] 使用条件】你打算回复的字数在100字以内时使用，会被系统分为多条消息发送，更像人们的聊天风格。例如日常闲聊时使用 [SHORT]。\n"
+        "【[LONG] 使用条件】你打算回复的字数超过100字时使用，只会发送一条消息，避免消息太多刷屏。例如你的回复是一篇短文、文章、代码、包含多个列表项或者是长段落时使用 [LONG]。\n"
         "标签必须放在最前面，不要附带任何解释。"
     )
     TAG_DETECT_MAX_CHARS = 64
+    TAG_PREFIX_CANDIDATES = ("[short]", "[long]")
     REPEATED_PUNCTUATION_CHARS = frozenset({"…", "—"})
     THINKING_BUFFER_MAX_CHARS = 4096
 
@@ -105,7 +109,7 @@ class StreamChunkPlugin(Star):
             if self.split_pattern.search("") is not None:
                 raise ValueError("分段正则不能匹配空字符串")
         except (re.error, ValueError) as e:
-            logger.error(f"streamchunk: 分段标点正则表达式无效: {e}，将回退到默认设置")
+            logger.error("streamchunk: 分段标点正则表达式无效: %s，将回退到默认设置", e)
             self.split_pattern = re.compile(r"[。？！!?；;…\n]")
 
         drop_punctuations = str(
@@ -117,7 +121,7 @@ class StreamChunkPlugin(Star):
                 raise ValueError("丢弃正则不能匹配空字符串")
         except (re.error, ValueError) as e:
             logger.error(
-                f"streamchunk: 丢弃分段符号正则表达式无效: {e}，将回退到默认设置"
+                "streamchunk: 丢弃分段符号正则表达式无效: %s，将回退到默认设置", e
             )
             self.drop_pattern = re.compile(r"[。.]")
 
@@ -178,7 +182,7 @@ class StreamChunkPlugin(Star):
             patched_meta = replace(event.platform_meta, support_streaming_message=True)
         except Exception as e:
             logger.warning(
-                f"streamchunk: 平台元数据改写失败，将仅依赖 enable_streaming: {e}"
+                "streamchunk: 平台元数据改写失败，将仅依赖 enable_streaming: %s", e
             )
             return
 
@@ -256,7 +260,7 @@ class StreamChunkPlugin(Star):
         if (
             self.local_stream_processing
             and is_stream_unsupported
-            and not event.get_extra("_streamchunk_stream_patched", False)
+            and not event.get_extra(self.STREAM_PATCHED_KEY, False)
         ):
             # Keep model-side streaming enabled and force pipeline streaming branch.
             event.set_extra("enable_streaming", True)
@@ -273,7 +277,7 @@ class StreamChunkPlugin(Star):
                 await self._process_stream_locally(event, generator)
 
             event.send_streaming = patched_send_streaming  # type: ignore[method-assign]
-            event.set_extra("_streamchunk_stream_patched", True)
+            event.set_extra(self.STREAM_PATCHED_KEY, True)
 
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -303,20 +307,28 @@ class StreamChunkPlugin(Star):
                 return cleaned
             cleaned = cleaned[match.end() :].lstrip()
 
-    def _extract_mode(self, text: str) -> tuple[str | None, str]:
-        text_without_thinking = text
+    def _strip_thinking(self, text: str) -> str | None:
+        """移除开头的思考块；没有思考块时原样返回，思考块未闭合时返回 None。"""
         stripped = text.lstrip()
-        if stripped.startswith("<think>"):
-            closing_index = stripped.find("</think>")
-            if closing_index == -1:
-                return None, ""
-            text_without_thinking = stripped[closing_index + len("</think>") :].lstrip()
+        if not stripped.startswith(self.THINKING_OPEN_TAG):
+            return text
+        closing_index = stripped.find(self.THINKING_CLOSE_TAG)
+        if closing_index == -1:
+            return None
+        return stripped[closing_index + len(self.THINKING_CLOSE_TAG) :]
 
-        match = self.TAG_PATTERN.match(text_without_thinking)
+    def _extract_mode(self, text: str) -> tuple[str | None, str]:
+        body = self._strip_thinking(text)
+        if body is None:
+            return None, ""
+        if body != text:
+            body = body.lstrip()
+
+        match = self.TAG_PATTERN.match(body)
         if not match:
-            return None, text_without_thinking
+            return None, body
         mode = match.group(1).lower()
-        cleaned = self._strip_leading_mode_tags(text_without_thinking[match.end() :])
+        cleaned = self._strip_leading_mode_tags(body[match.end() :])
         return mode, cleaned
 
     def _strip_leading_control_tags(self, text: str) -> str:
@@ -325,21 +337,42 @@ class StreamChunkPlugin(Star):
             return text
         return self._strip_leading_mode_tags(text)
 
-    def _strip_mode_tags_from_contexts(self, contexts: list[dict[str, Any]]) -> None:
-        """清理请求中已存在的助手标签，不改写用户和工具消息。"""
-        for message_index in range(len(contexts) - 1, -1, -1):
-            message = contexts[message_index]
-            if message.get("role") != "assistant":
+    @staticmethod
+    def _get_mapping_field(item: dict[str, Any], name: str) -> Any:
+        return item.get(name)
+
+    @staticmethod
+    def _set_mapping_field(item: dict[str, Any], name: str, value: Any) -> None:
+        item[name] = value
+
+    @staticmethod
+    def _get_attribute_field(item: Any, name: str) -> Any:
+        return getattr(item, name, None)
+
+    def _strip_mode_tags_from_messages(
+        self,
+        messages: list[Any],
+        get_field: Callable[[Any, str], Any],
+        set_field: Callable[[Any, str, Any], None],
+    ) -> None:
+        """移除助手消息开头的分段控制标签，不改写用户和工具消息。
+
+        消息与内容块可以是字典（请求上下文）或对象（运行历史），
+        通过 get_field/set_field 统一读写。
+        """
+        for message_index in range(len(messages) - 1, -1, -1):
+            message = messages[message_index]
+            if get_field(message, "role") != "assistant":
                 continue
 
-            content = message.get("content")
+            content = get_field(message, "content")
             if isinstance(content, str):
                 cleaned = self._strip_leading_control_tags(content)
                 if cleaned != content:
-                    if cleaned or message.get("tool_calls"):
-                        message["content"] = cleaned
+                    if cleaned or get_field(message, "tool_calls"):
+                        set_field(message, "content", cleaned)
                     else:
-                        del contexts[message_index]
+                        del messages[message_index]
                 continue
             if not isinstance(content, list):
                 continue
@@ -347,21 +380,21 @@ class StreamChunkPlugin(Star):
             first_text_index = 0
             while (
                 first_text_index < len(content)
-                and content[first_text_index].get("type") == "think"
+                and get_field(content[first_text_index], "type") == "think"
             ):
                 first_text_index += 1
 
             end_index = first_text_index
             while (
                 end_index < len(content)
-                and content[end_index].get("type") == "text"
+                and get_field(content[end_index], "type") == "text"
             ):
                 end_index += 1
             if end_index == first_text_index:
                 continue
 
             text = "".join(
-                content[index]["text"]
+                get_field(content[index], "text")
                 for index in range(first_text_index, end_index)
             )
             cleaned = self._strip_leading_control_tags(text)
@@ -372,77 +405,34 @@ class StreamChunkPlugin(Star):
             index = first_text_index
             while index < end_index and removed_chars:
                 part = content[index]
-                if removed_chars < len(part["text"]):
-                    part["text"] = part["text"][removed_chars:]
+                part_text = get_field(part, "text")
+                if removed_chars < len(part_text):
+                    set_field(part, "text", part_text[removed_chars:])
                     break
-                removed_chars -= len(part["text"])
+                removed_chars -= len(part_text)
                 index += 1
             del content[first_text_index:index]
-            if not content and not message.get("tool_calls"):
-                del contexts[message_index]
+            if not content and not get_field(message, "tool_calls"):
+                del messages[message_index]
+
+    def _strip_mode_tags_from_contexts(self, contexts: list[dict[str, Any]]) -> None:
+        """清理请求中已存在的助手标签。"""
+        self._strip_mode_tags_from_messages(
+            contexts,
+            self._get_mapping_field,
+            self._set_mapping_field,
+        )
 
     def _strip_mode_tags_from_history(self, run_context: Any) -> None:
         """从待持久化的全部助手消息中移除分段控制标签。"""
         messages = getattr(run_context, "messages", None)
         if not isinstance(messages, list):
             return
-
-        for message_index in range(len(messages) - 1, -1, -1):
-            message = messages[message_index]
-            if getattr(message, "role", None) != "assistant":
-                continue
-
-            parts = getattr(message, "content", None)
-            if isinstance(parts, str):
-                cleaned = self._strip_leading_control_tags(parts)
-                if cleaned != parts:
-                    if cleaned or getattr(message, "tool_calls", None):
-                        message.content = cleaned
-                    else:
-                        del messages[message_index]
-                continue
-            if not isinstance(parts, list):
-                continue
-
-            first_text_index = 0
-            while (
-                first_text_index < len(parts)
-                and getattr(parts[first_text_index], "type", None) == "think"
-            ):
-                first_text_index += 1
-
-            if (
-                first_text_index >= len(parts)
-                or getattr(parts[first_text_index], "type", None) != "text"
-            ):
-                continue
-
-            end_index = first_text_index
-            text_parts = []
-            while (
-                end_index < len(parts)
-                and getattr(parts[end_index], "type", None) == "text"
-            ):
-                text_parts.append(parts[end_index])
-                end_index += 1
-
-            text = "".join(part.text for part in text_parts)
-            cleaned = self._strip_leading_control_tags(text)
-            if cleaned == text:
-                continue
-
-            removed_chars = len(text) - len(cleaned)
-            index = first_text_index
-            while index < end_index and removed_chars:
-                part = parts[index]
-                if removed_chars < len(part.text):
-                    part.text = part.text[removed_chars:]
-                    break
-                removed_chars -= len(part.text)
-                index += 1
-            del parts[first_text_index:index]
-            if not parts and not getattr(message, "tool_calls", None):
-                del messages[message_index]
+        self._strip_mode_tags_from_messages(
+            messages,
+            self._get_attribute_field,
+            setattr,
+        )
 
     def _restore_llm_response(self, event: AstrMessageEvent, response: Any) -> None:
         """恢复仅为平台历史清理而临时改写的模型响应。"""
@@ -490,12 +480,14 @@ class StreamChunkPlugin(Star):
         run_context: Any,
         response: Any,
     ):
-        """清理内部会话历史后恢复用于发送的完整模型响应。"""
+        """清理内部会话历史后恢复用于发送的完整模型响应和平台元数据。"""
         try:
             if self._should_handle_event(event):
                 self._strip_mode_tags_from_history(run_context)
         finally:
             self._restore_llm_response(event, response)
+            # 流式消费结束时也会恢复；这里覆盖未进入本地流式消费的情况。
+            self._restore_event_streaming_pipeline(event)
 
     def _detect_mode_from_prefix(self, text: str) -> tuple[str | None, str, bool]:
         """Detect mode from stream prefix.
@@ -505,33 +497,40 @@ class StreamChunkPlugin(Star):
             remaining: text after removing tag if present
             need_more: True when tag parsing is still uncertain
         """
-        stripped = text.lstrip()
-        if stripped.startswith("<think>"):
-            closing_index = stripped.find("</think>")
-            if closing_index == -1:
-                return None, "", True
+        has_thinking = text.lstrip().startswith(self.THINKING_OPEN_TAG)
+        body = self._strip_thinking(text)
+        if body is None:
+            return None, "", True
 
-            after_thinking = stripped[closing_index + len("</think>") :]
-            mode, cleaned_after = self._extract_mode(after_thinking)
-            if mode is not None:
-                return mode, cleaned_after, False
-            if len(after_thinking) < self.TAG_DETECT_MAX_CHARS:
-                return None, "", True
-            return self.default_mode_no_tag, after_thinking, False
-
-        mode, cleaned = self._extract_mode(text)
+        mode, cleaned = self._extract_mode(body)
         if mode is not None:
             return mode, cleaned, False
 
-        if len(text) < self.TAG_DETECT_MAX_CHARS:
+        if self._could_be_tag_prefix(body, allow_thinking=not has_thinking):
             return None, "", True
 
-        return self.default_mode_no_tag, text, False
+        return self.default_mode_no_tag, body, False
+
+    def _could_be_tag_prefix(self, text: str, allow_thinking: bool) -> bool:
+        """判断流式前缀是否仍可能补全为模式标签或思考块起始标记。"""
+        if len(text) >= self.TAG_DETECT_MAX_CHARS:
+            return False
+        stripped = text.lstrip()
+        if not stripped:
+            return True
+        lowered = stripped.lower()
+        if any(tag.startswith(lowered) for tag in self.TAG_PREFIX_CANDIDATES):
+            return True
+        return allow_thinking and self.THINKING_OPEN_TAG.startswith(stripped)
+
+    def _resolve_mode(self, mode: str, text: str) -> str:
+        """将 auto 模式按文本长度解析为 short 或 long。"""
+        if mode != "auto":
+            return mode
+        return "short" if len(text) <= self.auto_short_max_chars else "long"
 
     def _default_mode(self, text: str) -> str:
-        if self.default_mode_no_tag in {"short", "long"}:
-            return self.default_mode_no_tag
-        return "short" if len(text) <= self.auto_short_max_chars else "long"
+        return self._resolve_mode(self.default_mode_no_tag, text)
 
     @staticmethod
     def _is_grapheme_extend(char: str) -> bool:
@@ -600,7 +599,8 @@ class StreamChunkPlugin(Star):
             config = get_config(getattr(event, "unified_msg_origin", None))
         except Exception as e:
             logger.warning(
-                f"streamchunk: failed to get AstrBot config for forward threshold: {e}"
+                "streamchunk: failed to get AstrBot config for forward threshold: %s",
+                e,
             )
             return 0
 
@@ -715,17 +715,7 @@ class StreamChunkPlugin(Star):
         event: AstrMessageEvent,
         text: str,
     ) -> tuple[int, bool]:
-        chunks, remain, limit_reached = self._split_short_text_incremental(
-            text,
-            final=True,
-        )
-        await self._send_chunks(event, chunks)
-
-        if limit_reached and remain.strip():
-            logger.info("streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。")
-            await self._send_long_text_if_present(event, remain)
-
-        return len(chunks), limit_reached
+        return await self._send_final_short_text(event, text, sent_chunks=0)
 
     async def _send_chunks(self, event: AstrMessageEvent, chunks: list[str]) -> None:
         total = len(chunks)
@@ -742,7 +732,7 @@ class StreamChunkPlugin(Star):
                     if remaining_interval > 0:
                         await asyncio.sleep(remaining_interval)
 
-            logger.info(
+            logger.debug(
                 "streamchunk: 发送分段消息 %s/%s (len=%s)",
                 idx + 1,
                 total,
@@ -763,6 +753,24 @@ class StreamChunkPlugin(Star):
             await event.send(MessageChain([Plain(text)]))
             return ""
         return long_buffer
+
+    async def _send_final_short_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        sent_chunks: int,
+    ) -> tuple[int, bool]:
+        """发送 SHORT 缓冲的全部内容，达到分段上限时剩余内容整段发送。"""
+        chunks, remain, limit_reached = self._split_short_text_incremental(
+            text,
+            final=True,
+            sent_chunks=sent_chunks,
+        )
+        await self._send_chunks(event, chunks)
+        if limit_reached and remain.strip():
+            logger.info("streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。")
+            await self._send_long_text_if_present(event, remain)
+        return len(chunks), limit_reached
 
     async def _flush_text_buffer(
         self,
@@ -790,13 +798,6 @@ class StreamChunkPlugin(Star):
     ) -> str:
         pending_prefix = prefix_buffer
         if mode is None and pending_prefix:
-            stripped_prefix = pending_prefix.lstrip()
-            if stripped_prefix.startswith("<think>"):
-                closing_index = stripped_prefix.find("</think>")
-                if closing_index == -1:
-                    pending_prefix = ""
-                else:
-                    pending_prefix = stripped_prefix[closing_index + len("</think>") :]
             _, pending_prefix = self._extract_mode(pending_prefix)
         return f"{pending_prefix}{text_buffer}".strip()
 
@@ -810,11 +811,12 @@ class StreamChunkPlugin(Star):
         text_buffer = ""
         short_chunks_sent = 0
         discarding_thinking = False
+        thinking_close_tail = ""
         seen_tool_start_count = self._get_tool_start_count(event)
 
         async def flush_tool_boundary_buffer(log_message: str) -> None:
             nonlocal mode, prefix_buffer, text_buffer, short_chunks_sent
-            nonlocal discarding_thinking, seen_tool_start_count
+            nonlocal discarding_thinking, thinking_close_tail, seen_tool_start_count
 
             pending = self._collect_buffered_break_text(
                 mode,
@@ -831,6 +833,7 @@ class StreamChunkPlugin(Star):
             text_buffer = ""
             short_chunks_sent = 0
             discarding_thinking = False
+            thinking_close_tail = ""
             seen_tool_start_count = self._get_tool_start_count(event)
 
         async def flush_on_tool_start() -> None:
@@ -861,14 +864,12 @@ class StreamChunkPlugin(Star):
 
                 for comp in chain.chain:
                     if not isinstance(comp, Plain):
-                        if mode is None and prefix_buffer.strip():
-                            mode = self.default_mode_no_tag
-                            if mode == "auto":
-                                mode = (
-                                    "short"
-                                    if len(prefix_buffer) <= self.auto_short_max_chars
-                                    else "long"
-                                )
+                        if (
+                            mode is None
+                            and prefix_buffer.strip()
+                            and self._strip_thinking(prefix_buffer) is not None
+                        ):
+                            mode = self._default_mode(prefix_buffer)
                             text_buffer += self._collect_buffered_break_text(
                                 mode=None,
                                 prefix_buffer=prefix_buffer,
@@ -876,14 +877,21 @@ class StreamChunkPlugin(Star):
                             )
                             prefix_buffer = ""
 
-                        if mode == "auto":
-                            mode = (
-                                "short"
-                                if len(text_buffer) <= self.auto_short_max_chars
-                                else "long"
-                            )
-
                         if mode is not None:
+                            mode = self._resolve_mode(mode, text_buffer)
+
+                        if mode == "short":
+                            sent_result = await self._send_final_short_text(
+                                event,
+                                text_buffer,
+                                short_chunks_sent,
+                            )
+                            sent_count, limit_reached = sent_result
+                            short_chunks_sent += sent_count
+                            text_buffer = ""
+                            if limit_reached:
+                                mode = "long"
+                        elif mode is not None:
                             text_buffer = await self._flush_text_buffer(
                                 event,
                                 mode,
@@ -902,11 +910,18 @@ class StreamChunkPlugin(Star):
                     )
 
                     if discarding_thinking:
-                        closing_index = incoming.find("</think>")
+                        incoming = thinking_close_tail + incoming
+                        closing_index = incoming.find(self.THINKING_CLOSE_TAG)
                         if closing_index == -1:
+                            thinking_close_tail = incoming[
+                                -(len(self.THINKING_CLOSE_TAG) - 1) :
+                            ]
                             continue
                         discarding_thinking = False
-                        incoming = incoming[closing_index + len("</think>") :]
+                        thinking_close_tail = ""
+                        incoming = incoming[
+                            closing_index + len(self.THINKING_CLOSE_TAG) :
+                        ]
                         if not incoming:
                             continue
 
@@ -919,19 +934,25 @@ class StreamChunkPlugin(Star):
                         )
                         if need_more:
                             if (
-                                prefix_buffer.lstrip().startswith("<think>")
+                                prefix_buffer.lstrip().startswith(
+                                    self.THINKING_OPEN_TAG
+                                )
                                 and len(prefix_buffer) > self.THINKING_BUFFER_MAX_CHARS
                             ):
                                 logger.warning(
                                     "streamchunk: 未闭合的思考内容超过缓冲上限，已丢弃。"
                                 )
+                                thinking_close_tail = prefix_buffer[
+                                    -(len(self.THINKING_CLOSE_TAG) - 1) :
+                                ]
                                 prefix_buffer = ""
                                 discarding_thinking = True
                             continue
                         mode = mode_candidate
                         if mode is not None:
                             logger.info(
-                                f"streamchunk: 从模型输出流提取到响应模式: [{mode.upper()}]"
+                                "streamchunk: 从模型输出流提取到响应模式: [%s]",
+                                mode.upper(),
                             )
                         prefix_buffer = ""
                         incoming = remaining
@@ -940,10 +961,12 @@ class StreamChunkPlugin(Star):
 
                     text_buffer += incoming
 
-                    if mode == "auto":
-                        if len(text_buffer) > self.auto_short_max_chars:
-                            mode = "long"
-                        # 这里保持缓冲，不进行 flush
+                    # auto 在超过阈值前继续缓冲，避免尚未生成完就按 short 发送。
+                    if (
+                        mode == "auto"
+                        and self._resolve_mode(mode, text_buffer) == "long"
+                    ):
+                        mode = "long"
 
                     if mode == "short":
                         chunks, remain, limit_reached = (
@@ -965,45 +988,27 @@ class StreamChunkPlugin(Star):
             if mode is None:
                 if discarding_thinking:
                     prefix_buffer = ""
-                mode_candidate, remaining, need_more = self._detect_mode_from_prefix(
-                    prefix_buffer
-                )
-                if need_more:
-                    remaining = prefix_buffer
-                mode = mode_candidate or self.default_mode_no_tag
-                if mode == "auto":
-                    mode = (
-                        "short"
-                        if len(prefix_buffer) <= self.auto_short_max_chars
-                        else "long"
-                    )
+                mode_candidate, remaining = self._extract_mode(prefix_buffer)
                 text_buffer += remaining
+                mode = mode_candidate or self.default_mode_no_tag
             elif prefix_buffer:
                 text_buffer += prefix_buffer
 
-            if mode == "auto":
-                mode = (
-                    "short" if len(text_buffer) <= self.auto_short_max_chars else "long"
-                )
+            mode = self._resolve_mode(mode, text_buffer)
 
             if mode not in {"short", "long"}:
                 mode = "long"
 
             logger.info(
-                f"streamchunk: 流式返回处理完毕，最终采取发送模式: [{mode.upper()}]"
+                "streamchunk: 流式返回处理完毕，最终采取发送模式: [%s]",
+                mode.upper(),
             )
             if mode == "short":
-                chunks, remain, limit_reached = self._split_short_text_incremental(
+                await self._send_final_short_text(
+                    event,
                     text_buffer,
-                    final=True,
-                    sent_chunks=short_chunks_sent,
+                    short_chunks_sent,
                 )
-                await self._send_chunks(event, chunks)
-                if limit_reached and remain.strip():
-                    logger.info(
-                        "streamchunk: SHORT 模式分段达到上限，剩余内容改为整段发送。"
-                    )
-                    await self._send_long_text_if_present(event, remain)
                 return
             await self._flush_text_buffer(event, mode, text_buffer, final=True)
         finally:
@@ -1013,17 +1018,19 @@ class StreamChunkPlugin(Star):
     @filter.on_decorating_result(priority=-100)
     async def on_decorating_result(self, event: AstrMessageEvent):
         """Apply tag-based strategy for non-streaming outputs."""
-        if not self._should_handle_event(event):
-            return
-
         result = event.get_result()
-        if result is None or not result.chain:
+        if result is None:
             return
 
         if result.result_content_type in {
             ResultContentType.STREAMING_RESULT,
             ResultContentType.STREAMING_FINISH,
         }:
+            return
+
+        # 非流式回退可能没有触发 on_agent_done，且空消息链不会触发发送后钩子。
+        self._restore_event_streaming_pipeline(event)
+        if not self._should_handle_event(event) or not result.chain:
             return
 
         if self.only_model_result and not result.is_model_result():
@@ -1036,15 +1043,22 @@ class StreamChunkPlugin(Star):
         if not text:
             return
 
+        body = self._strip_thinking(text)
+        if body is None:
+            logger.warning("streamchunk: 思考内容未闭合，已跳过发送。")
+            result.chain = []
+            return
+
         mode, text = self._extract_mode(text)
         if mode is None:
             mode = self._default_mode(text)
-            logger.info(f"streamchunk: 未提取到标签，使用回退模式: [{mode.upper()}]")
+            logger.info("streamchunk: 未提取到标签，使用回退模式: [%s]", mode.upper())
         else:
-            logger.info(f"streamchunk: 从完整文本提取到响应模式: [{mode.upper()}]")
+            logger.info("streamchunk: 从完整文本提取到响应模式: [%s]", mode.upper())
 
         if not text.strip():
-            logger.warning("streamchunk: 检测到由于标签截断导致的空内容，已跳过发送。")
+            logger.warning("streamchunk: 移除控制标签或思考内容后为空，已跳过发送。")
+            result.chain = []
             return
 
         if await self._send_forward_message(event, text):
@@ -1057,14 +1071,16 @@ class StreamChunkPlugin(Star):
         if mode == "short":
             chunk_count, limit_reached = await self._send_short_text(event, text)
             logger.info(
-                f"streamchunk: [{mode.upper()}] 模式，已发送 {chunk_count} 个分段消息。"
+                "streamchunk: [%s] 模式，已发送 %s 个分段消息。",
+                mode.upper(),
+                chunk_count,
             )
             if limit_reached:
                 logger.info("streamchunk: SHORT 模式剩余内容已改为整段发送。")
         else:
             await event.send(MessageChain([Plain(text)]))
             logger.info(
-                f"streamchunk: [{mode.upper()}] 模式，已发送一条完整长文本消息。"
+                "streamchunk: [%s] 模式，已发送一条完整长文本消息。", mode.upper()
             )
 
         # Clear chain to avoid duplicate send in respond stage.
