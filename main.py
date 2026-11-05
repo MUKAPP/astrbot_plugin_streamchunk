@@ -31,6 +31,8 @@ class StreamChunkPlugin(Star):
     LLM_RESPONSE_RESTORE_KEY = "_streamchunk_llm_response_restore"
     STREAM_PATCHED_KEY = "_streamchunk_stream_patched"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
+    # 模型偶尔把标签放到末尾，或按 Markdown 转义写成 \[SHORT]。
+    TRAILING_TAG_PATTERN = re.compile(r"\s*\\?\[(SHORT|LONG)\\?\]\s*\Z", re.IGNORECASE)
     THINKING_OPEN_TAG = "<think>"
     THINKING_CLOSE_TAG = "</think>"
     PROMPT_SENTINEL = "[STREAMCHUNK_LENGTH_TAG_RULE]"
@@ -39,7 +41,8 @@ class StreamChunkPlugin(Star):
         "你必须在回复开始前输出一个系统标签：[SHORT] 或 [LONG]。\n"
         "【[SHORT] 使用条件】你打算回复的字数在100字以内时使用，会被系统分为多条消息发送，更像人们的聊天风格。例如日常闲聊时使用 [SHORT]。\n"
         "【[LONG] 使用条件】你打算回复的字数超过100字时使用，只会发送一条消息，避免消息太多刷屏。例如你的回复是一篇短文、文章、代码、包含多个列表项或者是长段落时使用 [LONG]。\n"
-        "标签必须放在最前面，不要附带任何解释。"
+        "标签必须放在回复最前面，不要放在末尾或正文中间，也不要附带任何解释。\n"
+        "历史消息中的标签已被系统移除，无论历史格式如何，本次回复都必须以标签开头。"
     )
     TAG_DETECT_MAX_CHARS = 64
     TAG_PREFIX_CANDIDATES = ("[short]", "[long]")
@@ -317,7 +320,12 @@ class StreamChunkPlugin(Star):
             return None
         return stripped[closing_index + len(self.THINKING_CLOSE_TAG) :]
 
-    def _extract_mode(self, text: str) -> tuple[str | None, str]:
+    def _extract_mode(
+        self,
+        text: str,
+        include_trailing: bool = True,
+    ) -> tuple[str | None, str]:
+        """提取模式标签。include_trailing 仅用于完整文本，流式前缀不能判断末尾。"""
         body = self._strip_thinking(text)
         if body is None:
             return None, ""
@@ -326,9 +334,29 @@ class StreamChunkPlugin(Star):
 
         match = self.TAG_PATTERN.match(body)
         if not match:
-            return None, body
+            if not include_trailing:
+                return None, body
+            # 开头没有标签时，才采用末尾标签决定模式。
+            return self._extract_trailing_mode(body)
         mode = match.group(1).lower()
         cleaned = self._strip_leading_mode_tags(body[match.end() :])
+        if include_trailing:
+            cleaned = self._extract_trailing_mode(cleaned)[1]
+        return mode, cleaned
+
+    def _extract_trailing_mode(self, text: str) -> tuple[str | None, str]:
+        """识别并移除回复末尾的分段控制标签；没有标签时原样返回。"""
+        mode: str | None = None
+        cleaned = text
+        while True:
+            match = self.TRAILING_TAG_PATTERN.search(cleaned)
+            if not match:
+                break
+            if mode is None:
+                mode = match.group(1).lower()
+            cleaned = cleaned[: match.start()]
+        if mode is None:
+            return None, text
         return mode, cleaned
 
     def _strip_leading_control_tags(self, text: str) -> str:
@@ -336,6 +364,11 @@ class StreamChunkPlugin(Star):
         if not self.TAG_PATTERN.match(text):
             return text
         return self._strip_leading_mode_tags(text)
+
+    def _strip_control_tags(self, text: str) -> str:
+        """移除回复开头和末尾的分段控制标签，正文中间的标签保持不变。"""
+        cleaned = self._strip_leading_control_tags(text)
+        return self._extract_trailing_mode(cleaned)[1]
 
     @staticmethod
     def _get_mapping_field(item: dict[str, Any], name: str) -> Any:
@@ -355,7 +388,7 @@ class StreamChunkPlugin(Star):
         get_field: Callable[[Any, str], Any],
         set_field: Callable[[Any, str, Any], None],
     ) -> None:
-        """移除助手消息开头的分段控制标签，不改写用户和工具消息。
+        """移除助手消息开头和末尾的分段控制标签，不改写用户和工具消息。
 
         消息与内容块可以是字典（请求上下文）或对象（运行历史），
         通过 get_field/set_field 统一读写。
@@ -367,7 +400,7 @@ class StreamChunkPlugin(Star):
 
             content = get_field(message, "content")
             if isinstance(content, str):
-                cleaned = self._strip_leading_control_tags(content)
+                cleaned = self._strip_control_tags(content)
                 if cleaned != content:
                     if cleaned or get_field(message, "tool_calls"):
                         set_field(message, "content", cleaned)
@@ -390,30 +423,66 @@ class StreamChunkPlugin(Star):
                 and get_field(content[end_index], "type") == "text"
             ):
                 end_index += 1
-            if end_index == first_text_index:
-                continue
 
-            text = "".join(
-                get_field(content[index], "text")
-                for index in range(first_text_index, end_index)
-            )
-            cleaned = self._strip_leading_control_tags(text)
-            removed_chars = len(text) - len(cleaned)
-            if not removed_chars:
-                continue
+            changed = False
+            if end_index > first_text_index:
+                text = "".join(
+                    get_field(content[index], "text")
+                    for index in range(first_text_index, end_index)
+                )
+                cleaned = self._strip_leading_control_tags(text)
+                removed_chars = len(text) - len(cleaned)
+                if removed_chars:
+                    changed = True
+                    index = first_text_index
+                    while index < end_index and removed_chars:
+                        part = content[index]
+                        part_text = get_field(part, "text")
+                        if removed_chars < len(part_text):
+                            set_field(part, "text", part_text[removed_chars:])
+                            break
+                        removed_chars -= len(part_text)
+                        index += 1
+                    del content[first_text_index:index]
 
-            index = first_text_index
-            while index < end_index and removed_chars:
-                part = content[index]
-                part_text = get_field(part, "text")
-                if removed_chars < len(part_text):
-                    set_field(part, "text", part_text[removed_chars:])
-                    break
-                removed_chars -= len(part_text)
-                index += 1
-            del content[first_text_index:index]
-            if not content and not get_field(message, "tool_calls"):
+            if self._strip_trailing_tags_from_parts(content, get_field, set_field):
+                changed = True
+            if changed and not content and not get_field(message, "tool_calls"):
                 del messages[message_index]
+
+    def _strip_trailing_tags_from_parts(
+        self,
+        content: list[Any],
+        get_field: Callable[[Any, str], Any],
+        set_field: Callable[[Any, str, Any], None],
+    ) -> bool:
+        """移除末尾连续文本块中的分段控制标签，删除因此耗尽的文本块。"""
+        start_index = len(content)
+        while start_index > 0 and get_field(content[start_index - 1], "type") == "text":
+            start_index -= 1
+        if start_index == len(content):
+            return False
+
+        text = "".join(
+            get_field(content[index], "text")
+            for index in range(start_index, len(content))
+        )
+        _, cleaned = self._extract_trailing_mode(text)
+        removed_chars = len(text) - len(cleaned)
+        if not removed_chars:
+            return False
+
+        index = len(content)
+        while index > start_index and removed_chars:
+            part = content[index - 1]
+            part_text = get_field(part, "text")
+            if removed_chars < len(part_text):
+                set_field(part, "text", part_text[:-removed_chars])
+                break
+            removed_chars -= len(part_text)
+            index -= 1
+        del content[index:]
+        return True
 
     def _strip_mode_tags_from_contexts(self, contexts: list[dict[str, Any]]) -> None:
         """清理请求中已存在的助手标签。"""
@@ -459,7 +528,7 @@ class StreamChunkPlugin(Star):
         if not isinstance(text, str):
             return
 
-        cleaned = self._strip_leading_control_tags(text)
+        cleaned = self._strip_control_tags(text)
         if cleaned == text:
             return
 
@@ -502,7 +571,7 @@ class StreamChunkPlugin(Star):
         if body is None:
             return None, "", True
 
-        mode, cleaned = self._extract_mode(body)
+        mode, cleaned = self._extract_mode(body, include_trailing=False)
         if mode is not None:
             return mode, cleaned, False
 
@@ -799,7 +868,8 @@ class StreamChunkPlugin(Star):
         pending_prefix = prefix_buffer
         if mode is None and pending_prefix:
             _, pending_prefix = self._extract_mode(pending_prefix)
-        return f"{pending_prefix}{text_buffer}".strip()
+        pending = f"{pending_prefix}{text_buffer}"
+        return self._extract_trailing_mode(pending)[1].strip()
 
     async def _process_stream_locally(
         self,
@@ -807,6 +877,7 @@ class StreamChunkPlugin(Star):
         generator: AsyncGenerator[MessageChain, None],
     ) -> None:
         mode: str | None = None
+        mode_from_tag = False
         prefix_buffer = ""
         text_buffer = ""
         short_chunks_sent = 0
@@ -815,7 +886,7 @@ class StreamChunkPlugin(Star):
         seen_tool_start_count = self._get_tool_start_count(event)
 
         async def flush_tool_boundary_buffer(log_message: str) -> None:
-            nonlocal mode, prefix_buffer, text_buffer, short_chunks_sent
+            nonlocal mode, mode_from_tag, prefix_buffer, text_buffer, short_chunks_sent
             nonlocal discarding_thinking, thinking_close_tail, seen_tool_start_count
 
             pending = self._collect_buffered_break_text(
@@ -829,6 +900,7 @@ class StreamChunkPlugin(Star):
                     await event.send(MessageChain([Plain(pending)]))
 
             mode = None
+            mode_from_tag = False
             prefix_buffer = ""
             text_buffer = ""
             short_chunks_sent = 0
@@ -949,7 +1021,11 @@ class StreamChunkPlugin(Star):
                                 discarding_thinking = True
                             continue
                         mode = mode_candidate
-                        if mode is not None:
+                        mode_from_tag = (
+                            self._extract_mode(prefix_buffer, include_trailing=False)[0]
+                            is not None
+                        )
+                        if mode_from_tag:
                             logger.info(
                                 "streamchunk: 从模型输出流提取到响应模式: [%s]",
                                 mode.upper(),
@@ -990,9 +1066,18 @@ class StreamChunkPlugin(Star):
                     prefix_buffer = ""
                 mode_candidate, remaining = self._extract_mode(prefix_buffer)
                 text_buffer += remaining
+                mode_from_tag = mode_candidate is not None
                 mode = mode_candidate or self.default_mode_no_tag
             elif prefix_buffer:
                 text_buffer += prefix_buffer
+
+            trailing_mode, text_buffer = self._extract_trailing_mode(text_buffer)
+            # 开头没有标签且尚未分段发送时，末尾标签仍可决定本轮剩余内容的发送方式。
+            if trailing_mode is not None and not mode_from_tag and not short_chunks_sent:
+                logger.info(
+                    "streamchunk: 从回复末尾提取到响应模式: [%s]", trailing_mode.upper()
+                )
+                mode = trailing_mode
 
             mode = self._resolve_mode(mode, text_buffer)
 
