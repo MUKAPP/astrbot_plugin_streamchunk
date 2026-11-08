@@ -28,7 +28,7 @@ class StreamChunkPlugin(Star):
     TOOL_START_COUNT_KEY = "_streamchunk_tool_start_count"
     TOOL_BOUNDARY_FLUSH_CALLBACK_KEY = "_streamchunk_tool_boundary_flush_callback"
     LAST_SHORT_CHUNK_SENT_AT_KEY = "_streamchunk_last_short_chunk_sent_at"
-    LLM_RESPONSE_RESTORE_KEY = "_streamchunk_llm_response_restore"
+    LLM_RESPONSE_MODE_KEY = "_streamchunk_llm_response_mode"
     STREAM_PATCHED_KEY = "_streamchunk_stream_patched"
     TAG_PATTERN = re.compile(r"^\s*\[(SHORT|LONG)\]\s*", re.IGNORECASE)
     # 模型偶尔把标签放到末尾，或按 Markdown 转义写成 \[SHORT]。
@@ -345,6 +345,7 @@ class StreamChunkPlugin(Star):
         if not self._should_handle_event(event):
             return
 
+        event.set_extra(self.LLM_RESPONSE_MODE_KEY, None)
         self._strip_mode_tags_from_contexts(req.contexts)
 
         if not self.inject_prompt:
@@ -556,44 +557,56 @@ class StreamChunkPlugin(Star):
             setattr,
         )
 
-    def _restore_llm_response(self, event: AstrMessageEvent, response: Any) -> None:
-        """恢复仅为平台历史清理而临时改写的模型响应。"""
-        restore_data = event.get_extra(self.LLM_RESPONSE_RESTORE_KEY, None)
-        event.set_extra(self.LLM_RESPONSE_RESTORE_KEY, None)
-        if not isinstance(restore_data, tuple) or restore_data[0] is not response:
-            return
-
-        original_chain, original_components, original_text = restore_data[1:]
-        if original_chain is None:
-            response.completion_text = original_text
-            return
-
-        response.result_chain = original_chain
-        original_chain.chain[:] = original_components
+    def _consume_response_mode(self, event: AstrMessageEvent) -> str | None:
+        """取出并清除已清理标签的模型响应模式。"""
+        mode = cast(str | None, event.get_extra(self.LLM_RESPONSE_MODE_KEY, None))
+        event.set_extra(self.LLM_RESPONSE_MODE_KEY, None)
+        return mode
 
     @filter.on_llm_response(priority=100)
     async def on_llm_response(self, event: AstrMessageEvent, response: Any):
-        """临时移除标签，避免平台群聊历史保存控制文本。"""
+        """记录分段模式并移除标签，保留后续插件对响应的修改。"""
         if not self._should_handle_event(event):
             return
 
-        text = getattr(response, "completion_text", None)
+        event.set_extra(self.LLM_RESPONSE_MODE_KEY, None)
+        result_chain = getattr(response, "result_chain", None)
+        if result_chain is None:
+            text = getattr(response, "completion_text", None)
+        else:
+            text = "".join(
+                comp.text for comp in result_chain.chain if isinstance(comp, Plain)
+            )
         if not isinstance(text, str):
             return
 
+        mode, _ = self._extract_mode(text)
+        event.set_extra(self.LLM_RESPONSE_MODE_KEY, mode)
         cleaned = self._strip_control_tags(text)
         if cleaned == text:
             return
 
-        original_chain = getattr(response, "result_chain", None)
-        original_components = (
-            list(original_chain.chain) if original_chain is not None else None
-        )
-        event.set_extra(
-            self.LLM_RESPONSE_RESTORE_KEY,
-            (response, original_chain, original_components, text),
-        )
-        response.completion_text = cleaned
+        if result_chain is None:
+            response.completion_text = cleaned
+            return
+
+        # 只保留正文对应的文本范围，避免 completion_text setter 重排图文组件。
+        body_start = len(text) - len(self._strip_leading_control_tags(text))
+        body_end = body_start + len(cleaned)
+        text_offset = 0
+        cleaned_components = []
+        for comp in result_chain.chain:
+            if not isinstance(comp, Plain):
+                cleaned_components.append(comp)
+                continue
+
+            start = max(body_start - text_offset, 0)
+            end = min(body_end - text_offset, len(comp.text))
+            text_offset += len(comp.text)
+            if start < end:
+                comp.text = comp.text[start:end]
+                cleaned_components.append(comp)
+        result_chain.chain[:] = cleaned_components
 
     @filter.on_agent_done(priority=100)
     async def on_agent_done(
@@ -602,12 +615,11 @@ class StreamChunkPlugin(Star):
         run_context: Any,
         response: Any,
     ):
-        """清理内部会话历史后恢复用于发送的完整模型响应和平台元数据。"""
+        """清理内部会话历史并恢复平台元数据，不覆盖模型响应。"""
         try:
             if self._should_handle_event(event):
                 self._strip_mode_tags_from_history(run_context)
         finally:
-            self._restore_llm_response(event, response)
             # 流式消费结束时也会恢复；这里覆盖未进入本地流式消费的情况。
             self._restore_event_streaming_pipeline(event)
 
@@ -994,7 +1006,9 @@ class StreamChunkPlugin(Star):
                             and prefix_buffer.strip()
                             and self._strip_thinking(prefix_buffer) is not None
                         ):
-                            mode = self._default_mode(prefix_buffer)
+                            response_mode = self._consume_response_mode(event)
+                            mode = response_mode or self._default_mode(prefix_buffer)
+                            mode_from_tag = response_mode is not None
                             text_buffer += self._collect_buffered_break_text(
                                 mode=None,
                                 prefix_buffer=prefix_buffer,
@@ -1078,6 +1092,11 @@ class StreamChunkPlugin(Star):
                             self._extract_mode(prefix_buffer, include_trailing=False)[0]
                             is not None
                         )
+                        # 非流式回退也可能在响应钩子之后转成流式片段，标签已被清理。
+                        response_mode = self._consume_response_mode(event)
+                        if not mode_from_tag and response_mode is not None:
+                            mode = response_mode
+                            mode_from_tag = True
                         if mode_from_tag:
                             logger.info(
                                 "streamchunk: 从模型输出流提取到响应模式: [%s]",
@@ -1119,8 +1138,9 @@ class StreamChunkPlugin(Star):
                     prefix_buffer = ""
                 mode_candidate, remaining = self._extract_mode(prefix_buffer)
                 text_buffer += remaining
-                mode_from_tag = mode_candidate is not None
-                mode = mode_candidate or self.default_mode_no_tag
+                response_mode = self._consume_response_mode(event)
+                mode_from_tag = mode_candidate is not None or response_mode is not None
+                mode = mode_candidate or response_mode or self.default_mode_no_tag
             elif prefix_buffer:
                 text_buffer += prefix_buffer
 
@@ -1151,6 +1171,7 @@ class StreamChunkPlugin(Star):
             await self._flush_text_buffer(event, mode, text_buffer, final=True)
         finally:
             event.set_extra(self.TOOL_BOUNDARY_FLUSH_CALLBACK_KEY, None)
+            event.set_extra(self.LLM_RESPONSE_MODE_KEY, None)
             self._restore_event_streaming_pipeline(event)
 
     @filter.on_decorating_result(priority=-100)
@@ -1164,7 +1185,13 @@ class StreamChunkPlugin(Star):
             ResultContentType.STREAMING_RESULT,
             ResultContentType.STREAMING_FINISH,
         }:
+            if result.result_content_type == ResultContentType.STREAMING_FINISH:
+                event.set_extra(self.LLM_RESPONSE_MODE_KEY, None)
             return
+
+        response_mode = None
+        if result.is_model_result():
+            response_mode = self._consume_response_mode(event)
 
         # 非流式回退可能没有触发 on_agent_done，且空消息链不会触发发送后钩子。
         self._restore_event_streaming_pipeline(event)
@@ -1188,11 +1215,12 @@ class StreamChunkPlugin(Star):
             return
 
         mode, text = self._extract_mode(text)
+        mode = mode or response_mode
         if mode is None:
             mode = self._default_mode(text)
             logger.info("streamchunk: 未提取到标签，使用回退模式: [%s]", mode.upper())
         else:
-            logger.info("streamchunk: 从完整文本提取到响应模式: [%s]", mode.upper())
+            logger.info("streamchunk: 使用模型标签指定的响应模式: [%s]", mode.upper())
 
         if not text.strip():
             logger.warning("streamchunk: 移除控制标签或思考内容后为空，已跳过发送。")
