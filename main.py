@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType,
 from astrbot.api.message_components import Node, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.message import TextPart
 
 
 @register(
@@ -284,6 +285,36 @@ class StreamChunkPlugin(Star):
             event.send_streaming = patched_send_streaming  # type: ignore[method-assign]
             event.set_extra(self.STREAM_PATCHED_KEY, True)
 
+    def _append_prompt_to_user_content(self, req: ProviderRequest) -> bool:
+        """将本轮标签规则追加到当前用户消息末尾，而不是历史上下文。"""
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(extra_parts, list):
+            for part in extra_parts:
+                text = (
+                    part.get("text")
+                    if isinstance(part, dict)
+                    else getattr(part, "text", None)
+                )
+                if isinstance(text, str) and self.PROMPT_SENTINEL in text:
+                    return True
+            text_part = TextPart(text=self.PROMPT_TEMPLATE)
+            mark_as_temp = getattr(text_part, "mark_as_temp", None)
+            if not callable(mark_as_temp):
+                return False
+            extra_parts.append(mark_as_temp())
+            return True
+
+        # 兼容没有 extra_user_content_parts 的旧版请求对象。
+        prompt = getattr(req, "prompt", None)
+        if isinstance(prompt, str):
+            if self.PROMPT_SENTINEL in prompt:
+                return True
+            separator = "" if not prompt or prompt.endswith("\n") else "\n"
+            req.prompt = f"{prompt}{separator}{self.PROMPT_TEMPLATE}"
+            return True
+
+        return False
+
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """清理历史控制标签，并按配置注入本轮标签规则。"""
@@ -295,6 +326,10 @@ class StreamChunkPlugin(Star):
         if not self.inject_prompt:
             return
 
+        if self._append_prompt_to_user_content(req):
+            return
+
+        # 没有可追加的当前输入时，保留系统提示词作为兜底。
         system_prompt = req.system_prompt or ""
         if self.PROMPT_SENTINEL in system_prompt:
             return
