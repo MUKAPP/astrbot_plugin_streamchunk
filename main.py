@@ -12,7 +12,6 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType,
 from astrbot.api.message_components import Node, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
-from astrbot.core.agent.message import TextPart
 
 
 @register(
@@ -285,6 +284,21 @@ class StreamChunkPlugin(Star):
             event.send_streaming = patched_send_streaming  # type: ignore[method-assign]
             event.set_extra(self.STREAM_PATCHED_KEY, True)
 
+    @staticmethod
+    def _create_temp_text_part(text: str) -> Any | None:
+        """创建仅发给 provider、不写入历史的文本块；旧版本不支持时返回 None。"""
+        try:
+            from astrbot.core.agent.message import TextPart
+
+            text_part = TextPart(text=text)
+        except (ImportError, TypeError, ValueError):
+            return None
+
+        mark_as_temp = getattr(text_part, "mark_as_temp", None)
+        if not callable(mark_as_temp):
+            return None
+        return mark_as_temp()
+
     def _append_prompt_to_user_content(self, req: ProviderRequest) -> bool:
         """将本轮标签规则追加到当前用户消息末尾，而不是历史上下文。"""
         extra_parts = getattr(req, "extra_user_content_parts", None)
@@ -297,11 +311,10 @@ class StreamChunkPlugin(Star):
                 )
                 if isinstance(text, str) and self.PROMPT_SENTINEL in text:
                     return True
-            text_part = TextPart(text=self.PROMPT_TEMPLATE)
-            mark_as_temp = getattr(text_part, "mark_as_temp", None)
-            if not callable(mark_as_temp):
+            temp_part = self._create_temp_text_part(self.PROMPT_TEMPLATE)
+            if temp_part is None:
                 return False
-            extra_parts.append(mark_as_temp())
+            extra_parts.append(temp_part)
             return True
 
         # 兼容没有 extra_user_content_parts 的旧版请求对象。
@@ -314,6 +327,17 @@ class StreamChunkPlugin(Star):
             return True
 
         return False
+
+    def _append_prompt_to_system_prompt(self, req: ProviderRequest) -> None:
+        """把本轮标签规则追加到系统提示词，作为无法进入用户消息时的兜底。"""
+        system_prompt = req.system_prompt or ""
+        if self.PROMPT_SENTINEL in system_prompt:
+            return
+
+        if system_prompt and not system_prompt.endswith("\n"):
+            system_prompt += "\n"
+        system_prompt += f"{self.PROMPT_TEMPLATE}\n"
+        req.system_prompt = system_prompt
 
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -329,15 +353,7 @@ class StreamChunkPlugin(Star):
         if self._append_prompt_to_user_content(req):
             return
 
-        # 没有可追加的当前输入时，保留系统提示词作为兜底。
-        system_prompt = req.system_prompt or ""
-        if self.PROMPT_SENTINEL in system_prompt:
-            return
-
-        if system_prompt and not system_prompt.endswith("\n"):
-            system_prompt += "\n"
-        system_prompt += f"{self.PROMPT_TEMPLATE}\n"
-        req.system_prompt = system_prompt
+        self._append_prompt_to_system_prompt(req)
 
     def _strip_leading_mode_tags(self, text: str) -> str:
         cleaned = text.lstrip()
